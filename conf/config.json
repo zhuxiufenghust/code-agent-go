@@ -1,0 +1,17 @@
+{
+    "log": {
+        "level": "debug",
+        "development": false,
+        "disableCaller": false,
+        "disableStacktrace": false,
+        "outputPaths": ["stderr", "logs/app.log"],
+        "errorOutputPaths": ["stderr", "logs/app.log"]
+    },
+    "openai": {
+        "model": "gpt-4o-mini",
+        "baseURLEnv": "OPENAI_BASE_URL",
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "options": {
+        }
+    }
+}
