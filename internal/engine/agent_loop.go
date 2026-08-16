@@ -244,7 +244,7 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 	em := emitter{
 		generate: func(ctx context.Context, turn int, history []schema.Message, tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
-
+			return e.provider.Generate(ctx, history, tools)
 		},
 		toolStart: func(turn int, tc schema.ToolCall) {
 			log.Info("tool call done", zap.String("tool_call_id", tc.ID), zap.String("tool_name", tc.Name),
