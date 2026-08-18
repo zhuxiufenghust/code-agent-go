@@ -4,8 +4,8 @@
         "development": false,
         "disableCaller": false,
         "disableStacktrace": false,
-        "outputPaths": ["stderr", "logs/app.log"],
-        "errorOutputPaths": ["stderr", "logs/app.log"]
+        "outputPaths": ["logs/app.log"],
+        "errorOutputPaths": ["logs/app.log"]
     },
     "openai": {
         "model": "gpt-4o-mini",

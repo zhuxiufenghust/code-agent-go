@@ -28,6 +28,13 @@ type registryImpl struct {
 	tools map[string]Tool
 }
 
+// NewRegistry 创建一个新的工具注册表实例。
+func NewRegistry() Registry {
+	return &registryImpl{
+		tools: make(map[string]Tool),
+	}
+}
+
 var registry = &registryImpl{
 	tools: make(map[string]Tool),
 }
