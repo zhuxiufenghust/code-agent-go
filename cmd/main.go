@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
+	"github.com/zhuxiufenghust/code-agent-go/internal/tui"
 
 	"path/filepath"
 
@@ -40,6 +43,25 @@ func main() {
 
 	printConfig(cfg)
 
+	// tea.WithAltScreen() 只隔离运行期“可见屏幕”，不会清除终端的滚动历史缓冲区。
+	// 若用户在 TUI 运行期间滚动终端（滚轮/滚动条），仍会露出启动前的主屏输出
+	// （如配置快照、历史命令）。\033[3J 在进入 alt screen 前擦除滚动历史，
+	// 使上滚只能看到空白。\033[2J\033[H 由 alt screen 替代，此处省略。
+	// 仅在真实终端下输出，避免污染管道/CI 日志。
+	if term := os.Getenv("TERM"); term != "" && term != "dumb" {
+		fmt.Fprint(os.Stdout, "\033[3J")
+	}
+
+	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model),
+		tea.WithAltScreen(),
+		// 启用鼠标(含滚轮)捕获：滚轮事件会作为 tea.MouseWheelMsg 交给程序，
+		// 由 viewport 在应用内滚动，而不是让终端去滚自己的滚动历史（从而看不到启动前输出）。
+		tea.WithMouseCellMotion())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
+
 }
 
 func printConfig(cfg *config.Config) {
@@ -54,6 +76,7 @@ func printConfig(cfg *config.Config) {
 	}
 	log.Debug("after normalize config", zap.String("config", string(b)))
 }
+
 func normalizeConfig() *config.Config {
 	if cliOp.configPath != nil {
 		filePath, err := filepath.Abs(*cliOp.configPath)
@@ -79,6 +102,7 @@ func normalizeConfig() *config.Config {
 	}
 	return cfg
 }
+
 func parseFlags(homeDir string, workDir string) {
 	cliOp.homeDir = homeDir
 	cliOp.workDir = workDir
