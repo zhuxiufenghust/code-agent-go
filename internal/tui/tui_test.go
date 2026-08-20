@@ -9,7 +9,7 @@ import (
 // TestInputReceivesKeystrokes 验证构造后 textarea 处于聚焦状态，
 // 普通字符按键能正确累加到 textarea.Value()。
 func TestInputReceivesKeystrokes(t *testing.T) {
-	m := New("/tmp", "test-model")
+	m := New("/tmp", "test-model", nil)
 
 	// 模拟依次键入 "hello"
 	for _, r := range "hello" {
@@ -40,7 +40,7 @@ func TestInputReceivesKeystrokes(t *testing.T) {
 
 // TestInitModelIsFocused 验证 New 构造的 model 其 textarea 已聚焦。
 func TestInitModelIsFocused(t *testing.T) {
-	m := New("/tmp", "test-model")
+	m := New("/tmp", "test-model", nil)
 	if !m.textarea.Focused() {
 		t.Fatal("构造后的 textarea 应处于聚焦状态, 否则无法接收按键")
 	}
@@ -48,7 +48,7 @@ func TestInitModelIsFocused(t *testing.T) {
 
 // TestAltEnterInsertsNewline 验证 Alt+Enter 能插入换行（多行输入）。
 func TestAltEnterInsertsNewline(t *testing.T) {
-	m := New("/tmp", "test-model")
+	m := New("/tmp", "test-model", nil)
 	// 输入 "hi"
 	for _, r := range "hi" {
 		key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
@@ -73,7 +73,7 @@ func TestAltEnterInsertsNewline(t *testing.T) {
 
 // TestCtrlJInsertsNewline 验证 Ctrl+J 能插入换行（终端可靠发送的兜底换行键）。
 func TestCtrlJInsertsNewline(t *testing.T) {
-	m := New("/tmp", "test-model")
+	m := New("/tmp", "test-model", nil)
 	for _, r := range "hi" {
 		key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
 		updated, _ := m.Update(key)

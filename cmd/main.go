@@ -8,7 +8,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
+	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
+	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
+	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tui"
 
 	"path/filepath"
@@ -52,7 +55,17 @@ func main() {
 		fmt.Fprint(os.Stdout, "\033[3J")
 	}
 
-	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model),
+	// 构建 agent 引擎并注入 TUI：provider(OpenAI) + 工具注册表 + engine。
+	// 若环境变量(OPENAI_API_KEY / OPENAI_BASE_URL)未设置，provider 会以空密钥运行，
+	// 运行期 StreamRun 会发出 EventError，由 TUI handleEvent 兜底展示，不会 panic。
+	reg := tools.NewRegistry()
+	reg.Register(tools.NewReadTool())
+	agent := engine.NewAgentEngine(
+		provider.NewOpenAIProvider(cfg.OpenAI),
+		reg,
+	)
+
+	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent),
 		tea.WithAltScreen(),
 		// 启用鼠标(含滚轮)捕获：滚轮事件会作为 tea.MouseWheelMsg 交给程序，
 		// 由 viewport 在应用内滚动，而不是让终端去滚自己的滚动历史（从而看不到启动前输出）。
