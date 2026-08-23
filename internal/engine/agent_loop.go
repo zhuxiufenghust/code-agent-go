@@ -30,6 +30,9 @@ type AgentEngine struct {
 	generateRetries    int           // LLM 生成调用最大尝试次数（默认 3）
 	generateRetryBase  time.Duration // 重试退避基准（默认 1s）
 	workDir            string
+
+	// 可选，指定 session ID；若为空则使用默认 session, 记忆是基于sessionID的
+	sessionID string
 }
 
 func WithToolTimeout(timeout time.Duration) Option {
@@ -92,6 +95,15 @@ func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts
 
 func (e *AgentEngine) buildSystemPrompt() string {
 	return prompt.BuildSystemPrompt(e.workDir)
+}
+
+func (e *AgentEngine) LoadHistoryContext(userInput string) string {
+	// TODO: 实现基于 sessionID 的历史消息加载
+	return ""
+}
+
+func (e *AgentEngine) SaveHistoryContext(userInput string, llmResponse string) {
+
 }
 
 func (e *AgentEngine) generateWithRetry(ctx context.Context, em emitter, turn int, history []schema.Message, toolDefs []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {

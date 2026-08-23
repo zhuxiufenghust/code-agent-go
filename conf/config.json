@@ -8,7 +8,7 @@
         "errorOutputPaths": ["logs/app.log"]
     },
     "openai": {
-        "model": "gpt-4o-mini",
+        "model": "hy3",
         "baseURLEnv": "OPENAI_BASE_URL",
         "apiKeyEnv": "OPENAI_API_KEY",
         "options": {
