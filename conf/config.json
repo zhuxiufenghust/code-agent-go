@@ -9,8 +9,8 @@
     },
     "openai": {
         "model": "hy3",
-        "baseURLEnv": "OPENAI_BASE_URL",
-        "apiKeyEnv": "OPENAI_API_KEY",
+        "baseURLEnv": "TEST_OPENAI_BASE_URL",
+        "apiKeyEnv": "TEST_OPENAI_API_KEY",
         "options": {
         }
     }

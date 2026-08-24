@@ -6,6 +6,8 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
 	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
@@ -20,6 +22,18 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"go.uber.org/zap"
 )
+
+func loadEnv() {
+	candidates := []string{".env"}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".env"))
+	}
+	for _, path := range candidates {
+		if err := godotenv.Load(path); err == nil {
+			break
+		}
+	}
+}
 
 func getDir() (string, string) {
 	homeDir, err := os.UserHomeDir()
@@ -38,6 +52,7 @@ func getDir() (string, string) {
 }
 
 func main() {
+	loadEnv()
 
 	homeDir, workDir := getDir()
 	parseFlags(homeDir, workDir)
@@ -54,16 +69,14 @@ func main() {
 	if term := os.Getenv("TERM"); term != "" && term != "dumb" {
 		fmt.Fprint(os.Stdout, "\033[3J")
 	}
+	pr := provider.NewOpenAIProvider(cfg.OpenAI)
+	registry := tools.NewRegistry()
 
-	// 构建 agent 引擎并注入 TUI：provider(OpenAI) + 工具注册表 + engine。
-	// 若环境变量(OPENAI_API_KEY / OPENAI_BASE_URL)未设置，provider 会以空密钥运行，
-	// 运行期 StreamRun 会发出 EventError，由 TUI handleEvent 兜底展示，不会 panic。
-	reg := tools.NewRegistry()
-	reg.Register(tools.NewReadTool())
-	agent := engine.NewAgentEngine(
-		provider.NewOpenAIProvider(cfg.OpenAI),
-		reg,
-	)
+	sessID := uuid.New().String()
+
+	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
+		engine.WithHomeDir(homeDir),
+		engine.WithSessionID(sessID))
 
 	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent),
 		tea.WithAltScreen(),

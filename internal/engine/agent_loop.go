@@ -30,9 +30,13 @@ type AgentEngine struct {
 	generateRetries    int           // LLM 生成调用最大尝试次数（默认 3）
 	generateRetryBase  time.Duration // 重试退避基准（默认 1s）
 	workDir            string
+	homeDir            string
 
 	// 可选，指定 session ID；若为空则使用默认 session, 记忆是基于sessionID的
 	sessionID string
+
+	memory             memory.Session // 可选，nil 表示无持久化
+	maxHistoryMsgLimit int            // 历史消息最大保留条数，超过则丢弃最旧的消息
 }
 
 func WithToolTimeout(timeout time.Duration) Option {
@@ -60,6 +64,21 @@ func WithGenerateRetryBase(base time.Duration) Option {
 func WithWorkDir(dir string) Option {
 	return func(e *AgentEngine) {
 		e.workDir = dir
+	}
+}
+func WithHomeDir(dir string) Option {
+	return func(e *AgentEngine) {
+		e.homeDir = dir
+	}
+}
+func WithMaxHistoryMsgLimit(limit int) Option {
+	return func(e *AgentEngine) {
+		e.maxHistoryMsgLimit = limit
+	}
+}
+func WithSessionID(sessID string) Option {
+	return func(e *AgentEngine) {
+		e.sessionID = sessID
 	}
 }
 
@@ -90,6 +109,17 @@ func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts
 	for _, opt := range opts {
 		opt(engine)
 	}
+
+	var err error
+	engine.session, err = memory.NewSQLiteSession(engine.sessionID, engine.homeDir)
+	if err != nil {
+		log.Error("failed to create SQLite session", zap.Error(err))
+		engine.session, _ = memory.NewMemorySession(engine.sessionID) // fallback to in-memory session
+	}
+	if engine.maxHistoryMsgLimit <= 0 || engine.maxHistoryMsgLimit > 100 {
+		engine.maxHistoryMsgLimit = 100 // default limit
+	}
+
 	return engine
 }
 
@@ -97,13 +127,40 @@ func (e *AgentEngine) buildSystemPrompt() string {
 	return prompt.BuildSystemPrompt(e.workDir)
 }
 
-func (e *AgentEngine) LoadHistoryContext(userInput string) string {
+// 加载历史上下文消息，返回包含系统提示、历史消息和当前用户输入的完整对话上下文。
+func (e *AgentEngine) LoadHistoryContext(ctx context.Context, userInput string) ([]schema.Message, int) {
 	// TODO: 实现基于 sessionID 的历史消息加载
-	return ""
+	userMsg := schema.Message{
+		Role:    schema.UserRole,
+		Content: userInput,
+	}
+	msgs, err := e.session.GetMessages(ctx, e.maxHistoryMsgLimit)
+	if err != nil || len(msgs) == 0 {
+		log.Warn("failed to load history context", zap.String("session_id", e.sessionID))
+		systemPrompt := e.buildSystemPrompt()
+		systemPromptMsg := schema.Message{
+			Role:    schema.SystemRole,
+			Content: systemPrompt,
+		}
+		return []schema.Message{systemPromptMsg, userMsg}, 0
+	}
+	startIndex := len(msgs)
+	msgs = append(msgs, schema.Message{
+		Role:    schema.UserRole,
+		Content: userInput,
+	})
+	return msgs, startIndex
 }
 
-func (e *AgentEngine) SaveHistoryContext(userInput string, llmResponse string) {
-
+// SaveHistoryContext 将当前轮次的消息追加到历史上下文中, 只保存新消息
+func (e *AgentEngine) SaveHistoryContext(ctx context.Context, msgs []schema.Message, startIndex int) {
+	if e.session == nil || len(msgs) == 0 || startIndex >= len(msgs) {
+		return
+	}
+	err := e.session.AddMessages(ctx, msgs[startIndex:])
+	if err != nil {
+		log.Error("failed to save history context", zap.Error(err), zap.String("session_id", e.sessionID))
+	}
 }
 
 func (e *AgentEngine) generateWithRetry(ctx context.Context, em emitter, turn int, history []schema.Message, toolDefs []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
@@ -184,19 +241,10 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 
 	var turnCount int
 	tools := e.registry.GetAvailableTools()
-	systemPrompt := e.buildSystemPrompt()
-	systemPromptMsg := schema.Message{
-		Role:    schema.SystemRole,
-		Content: systemPrompt,
-	}
+	llmContext, startIndex := e.LoadHistoryContext(ctx, userPrompt)
 
-	llmContext := []schema.Message{systemPromptMsg}
-
-	userPromptMsg := schema.Message{
-		Role:    schema.UserRole,
-		Content: userPrompt}
-	llmContext = append(llmContext, userPromptMsg)
-
+	log.Info("run_loop_start", zap.String("user_prompt", userPrompt), zap.Int("history_msg_count", len(llmContext)-1),
+		zap.Int("start_index", startIndex), zap.String("history_msgs", logfmt.FormatMsgs(llmContext[:len(llmContext)-1])))
 	for {
 		turnCount++
 
@@ -247,8 +295,8 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			return errToolCallFailed
 		}
 		log.Info("tool_call_succ", zap.Int("turn", turnCount), zap.Duration("tool_elapsed", toolElapsed))
-
 	}
+	e.SaveHistoryContext(ctx, llmContext, startIndex)
 
 	return nil
 }

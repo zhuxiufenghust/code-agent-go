@@ -87,6 +87,7 @@ func (lc *LogConfig) ToZapConfig() *zap.Config {
 		cfg.ErrorOutputPaths = lc.ErrorOutputPaths
 	}
 	cfg.Development = lc.Development
+	// 默认开启调用方信息；仅当用户显式关闭时才禁用。
 	cfg.DisableCaller = lc.DisableCaller
 	cfg.DisableStacktrace = lc.DisableStacktrace
 

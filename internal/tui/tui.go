@@ -290,7 +290,7 @@ func (m tuiModel) handleEvent(evt engine.Event) (tea.Model, tea.Cmd) {
 	switch evt.Type {
 	case engine.EventThinkingDelta:
 		delta, _ := evt.Data.(string)
-		log.Info("handle_event", zap.String("data", delta), zap.Any("type", evt.Type))
+		//log.Info("handle_event", zap.String("data", delta), zap.Any("type", evt.Type))
 		// thinking 块流式输出：累积到 pendingThinking，等本轮结束后再追加到 lines。
 		if m.thinkingLineStart == -1 {
 			m.lines = append(m.lines, thinkingHeaderStyle.Render("« thinking »"))
@@ -304,7 +304,7 @@ func (m tuiModel) handleEvent(evt engine.Event) (tea.Model, tea.Cmd) {
 		// 正文流式累积：把增量“拼接”进同一正文块并立即渲染，收到多少显示多少。
 		// 网关逐 token 流式则终端逐字出现；整块到达则整块拼接，不做任何延迟或动画。
 		delta, _ := evt.Data.(string)
-		log.Info("handle_event", zap.String("data", delta), zap.Any("type", evt.Type))
+		//log.Info("handle_event", zap.String("data", delta), zap.Any("type", evt.Type))
 		if m.actionLineStart == -1 {
 			m.lines = append(m.lines, "")
 			m.actionLineStart = len(m.lines) - 1
@@ -408,8 +408,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case SetTextMsg:
 		sm, _ := m.status.Update(msg)
 		m.status = sm.(LineText)
-		case eventMsg:
-			return m.handleEvent(engine.Event(msg))
+	case eventMsg:
+		return m.handleEvent(engine.Event(msg))
 
 	case tea.KeyMsg:
 		switch msg.String() {
