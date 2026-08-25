@@ -10,6 +10,8 @@ func NewLogger(config *zap.Config) {
 	if err != nil {
 		panic(err)
 	}
+	// log 包对 zap 做了一层封装，跳过 1 帧以定位到真正的调用方代码文件与行号。
+	logger = logger.WithOptions(zap.AddCallerSkip(1))
 }
 
 func Info(msg string, fields ...zap.Field) {

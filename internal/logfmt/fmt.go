@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
 )
 
 // MaxOutputLen 日志中单条输出的最大字节数。超出部分被截断并附加提示。
@@ -59,4 +61,13 @@ func FormatJSON(raw json.RawMessage) string {
 	// json.Encoder 的 Indent 不会缩进首行，需手动补齐
 	indented := strings.ReplaceAll(strings.TrimRight(pretty.String(), "\n"), "\n", "\n"+Indent+"  ")
 	return Indent + "  " + indented
+}
+func FormatMsgs(msgs []schema.Message) string {
+	var sb strings.Builder
+	for _, msg := range msgs {
+		b, _ := json.Marshal(msg)
+		sb.WriteString(string(b))
+		sb.WriteString(" ")
+	}
+	return sb.String()
 }

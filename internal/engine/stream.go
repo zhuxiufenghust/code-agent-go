@@ -5,8 +5,10 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/base"
+	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
 )
 
@@ -85,6 +87,8 @@ func (e *AgentEngine) StreamRun(ctx context.Context, userPrompt string) (<-chan 
 		}
 
 	})
+
+	log.Debug("stream_run", zap.String("user_prompt", userPrompt))
 
 	return ch, nil
 }

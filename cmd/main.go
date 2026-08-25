@@ -6,9 +6,14 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
+	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
+	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
+	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tui"
 
 	"path/filepath"
@@ -17,6 +22,18 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"go.uber.org/zap"
 )
+
+func loadEnv() {
+	candidates := []string{".env"}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".env"))
+	}
+	for _, path := range candidates {
+		if err := godotenv.Load(path); err == nil {
+			break
+		}
+	}
+}
 
 func getDir() (string, string) {
 	homeDir, err := os.UserHomeDir()
@@ -35,6 +52,7 @@ func getDir() (string, string) {
 }
 
 func main() {
+	loadEnv()
 
 	homeDir, workDir := getDir()
 	parseFlags(homeDir, workDir)
@@ -51,8 +69,16 @@ func main() {
 	if term := os.Getenv("TERM"); term != "" && term != "dumb" {
 		fmt.Fprint(os.Stdout, "\033[3J")
 	}
+	pr := provider.NewOpenAIProvider(cfg.OpenAI)
+	registry := tools.NewRegistry()
 
-	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model),
+	sessID := uuid.New().String()
+
+	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
+		engine.WithHomeDir(homeDir),
+		engine.WithSessionID(sessID))
+
+	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent),
 		tea.WithAltScreen(),
 		// 启用鼠标(含滚轮)捕获：滚轮事件会作为 tea.MouseWheelMsg 交给程序，
 		// 由 viewport 在应用内滚动，而不是让终端去滚自己的滚动历史（从而看不到启动前输出）。
