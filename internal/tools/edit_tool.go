@@ -30,7 +30,7 @@ func NewEditTool(workDir string, options ...EditToolOption) *EditTool {
 	tool := &EditTool{
 		ToolDefinition: schema.ToolDefinition{
 			Name:        "edit_tool",
-			Description: "编辑指定路径的文件内容。",
+			Description: "对现有文件进行局部的字符串替换。这比重写整个文件更安全、更快速。请提供足够的 source_text 上下文以确保匹配的唯一性。",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
