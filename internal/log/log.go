@@ -15,16 +15,28 @@ func NewLogger(config *zap.Config) {
 }
 
 func Info(msg string, fields ...zap.Field) {
+	if logger == nil {
+		return
+	}
 	logger.Info(msg, fields...)
 }
 
 func Error(msg string, fields ...zap.Field) {
+	if logger == nil {
+		return
+	}
 	logger.Error(msg, fields...)
 }
 func Debug(msg string, fields ...zap.Field) {
+	if logger == nil {
+		return
+	}
 	logger.Debug(msg, fields...)
 }
 
 func Warn(msg string, fields ...zap.Field) {
+	if logger == nil {
+		return
+	}
 	logger.Warn(msg, fields...)
 }

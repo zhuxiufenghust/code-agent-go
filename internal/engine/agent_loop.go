@@ -124,7 +124,7 @@ func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts
 }
 
 func (e *AgentEngine) buildSystemPrompt() string {
-	return prompt.BuildSystemPrompt(e.workDir)
+	return prompt.BuildSystemPrompt(e.workDir, e.registry.GetAvailableTools())
 }
 
 // 加载历史上下文消息，返回包含系统提示、历史消息和当前用户输入的完整对话上下文。

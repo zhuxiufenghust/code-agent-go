@@ -154,6 +154,7 @@ func registerTools(homeDir, workDir string) tools.Registry {
 	tools := []tools.Tool{
 		tools.NewEditTool(workDir),
 		tools.NewReadTool(workDir),
+		tools.NewWriteTool(workDir),
 		tools.NewBashTool(workDir),
 		tools.NewWebSearchTool(),
 	}
