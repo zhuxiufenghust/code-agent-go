@@ -3,24 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func writeTempFile(t *testing.T, content string) string {
-	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.txt")
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("创建临时文件失败: %v", err)
-	}
-	return path
-}
-
 func TestNewReadTool_Definition(t *testing.T) {
-	tool := NewReadTool()
+	tool := NewReadTool(t.TempDir())
 	def := tool.GetDefinition()
 	if def.Name != "read_tool" {
 		t.Errorf("期望 tool name 为 read_tool, 实际为 %q", def.Name)
@@ -34,7 +22,7 @@ func TestNewReadTool_Definition(t *testing.T) {
 }
 
 func TestReadTool_EmptyFilePath(t *testing.T) {
-	tool := NewReadTool()
+	tool := NewReadTool(t.TempDir())
 	input, _ := json.Marshal(map[string]interface{}{"file_path": ""})
 	_, err := tool.Execute(context.Background(), input)
 	if err == nil {
@@ -46,7 +34,7 @@ func TestReadTool_EmptyFilePath(t *testing.T) {
 }
 
 func TestReadTool_InvalidJSON(t *testing.T) {
-	tool := NewReadTool()
+	tool := NewReadTool(t.TempDir())
 	_, err := tool.Execute(context.Background(), json.RawMessage("not-json"))
 	if err == nil {
 		t.Fatal("期望非法 JSON 时返回错误")
@@ -54,8 +42,8 @@ func TestReadTool_InvalidJSON(t *testing.T) {
 }
 
 func TestReadTool_FileNotFound(t *testing.T) {
-	tool := NewReadTool()
-	input, _ := json.Marshal(map[string]interface{}{"file_path": "/no/such/file.txt"})
+	tool := NewReadTool(t.TempDir())
+	input, _ := json.Marshal(map[string]interface{}{"file_path": "no_such_file.txt"})
 	_, err := tool.Execute(context.Background(), input)
 	if err == nil {
 		t.Fatal("期望文件不存在时返回错误")
@@ -63,26 +51,23 @@ func TestReadTool_FileNotFound(t *testing.T) {
 }
 
 func TestReadTool_ReadByOffset(t *testing.T) {
-	content := "hello world"
-	path := writeTempFile(t, content)
-
-	tool := NewReadTool()
-	input, _ := json.Marshal(map[string]interface{}{"file_path": path})
+	dir := writeTempFileInDir(t, "test.txt", "hello world")
+	tool := NewReadTool(dir)
+	input, _ := json.Marshal(map[string]interface{}{"file_path": "test.txt"})
 	got, err := tool.Execute(context.Background(), input)
 	if err != nil {
 		t.Fatalf("读取失败: %v", err)
 	}
-	if got != content {
-		t.Errorf("期望 %q, 实际 %q", content, got)
+	if got != "hello world" {
+		t.Errorf("期望 %q, 实际 %q", "hello world", got)
 	}
 }
 
 func TestReadTool_ReadByOffsetWithLimit(t *testing.T) {
-	path := writeTempFile(t, "abcdefghij")
-
-	tool := NewReadTool()
+	dir := writeTempFileInDir(t, "test.txt", "abcdefghij")
+	tool := NewReadTool(dir)
 	input, _ := json.Marshal(map[string]interface{}{
-		"file_path": path,
+		"file_path": "test.txt",
 		"offset":    2,
 		"limit":     100,
 	})
@@ -96,11 +81,10 @@ func TestReadTool_ReadByOffsetWithLimit(t *testing.T) {
 }
 
 func TestReadTool_OffsetExceedsFileSize(t *testing.T) {
-	path := writeTempFile(t, "short")
-
-	tool := NewReadTool()
+	dir := writeTempFileInDir(t, "test.txt", "short")
+	tool := NewReadTool(dir)
 	input, _ := json.Marshal(map[string]interface{}{
-		"file_path": path,
+		"file_path": "test.txt",
 		"offset":    100,
 	})
 	_, err := tool.Execute(context.Background(), input)
@@ -113,11 +97,10 @@ func TestReadTool_OffsetExceedsFileSize(t *testing.T) {
 }
 
 func TestReadTool_TruncationByLimit(t *testing.T) {
-	path := writeTempFile(t, strings.Repeat("x", 100))
-
-	tool := NewReadTool()
+	dir := writeTempFileInDir(t, "test.txt", strings.Repeat("x", 100))
+	tool := NewReadTool(dir)
 	input, _ := json.Marshal(map[string]interface{}{
-		"file_path": path,
+		"file_path": "test.txt",
 		"limit":     10,
 	})
 	got, err := tool.Execute(context.Background(), input)
@@ -134,11 +117,10 @@ func TestReadTool_TruncationByLimit(t *testing.T) {
 
 func TestReadTool_ReadByLines(t *testing.T) {
 	lines := []string{"first", "second", "third", "fourth"}
-	path := writeTempFile(t, strings.Join(lines, "\n"))
-
-	tool := NewReadTool()
+	dir := writeTempFileInDir(t, "test.txt", strings.Join(lines, "\n"))
+	tool := NewReadTool(dir)
 	input, _ := json.Marshal(map[string]interface{}{
-		"file_path":  path,
+		"file_path":  "test.txt",
 		"start_line": 2,
 		"end_line":   3,
 	})
@@ -155,11 +137,10 @@ func TestReadTool_ReadByLines(t *testing.T) {
 
 func TestReadTool_ReadByLinesToEnd(t *testing.T) {
 	lines := []string{"a", "b", "c"}
-	path := writeTempFile(t, strings.Join(lines, "\n"))
-
-	tool := NewReadTool()
+	dir := writeTempFileInDir(t, "test.txt", strings.Join(lines, "\n"))
+	tool := NewReadTool(dir)
 	input, _ := json.Marshal(map[string]interface{}{
-		"file_path":  path,
+		"file_path":  "test.txt",
 		"start_line": 2,
 	})
 	got, err := tool.Execute(context.Background(), input)

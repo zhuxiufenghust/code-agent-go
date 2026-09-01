@@ -70,7 +70,7 @@ func main() {
 		fmt.Fprint(os.Stdout, "\033[3J")
 	}
 	pr := provider.NewOpenAIProvider(cfg.OpenAI)
-	registry := tools.NewRegistry()
+	registry := registerTools(homeDir, workDir)
 
 	sessID := uuid.New().String()
 
@@ -147,4 +147,18 @@ func parseFlags(homeDir string, workDir string) {
 	cliOp.enableTools = enableTools
 	cliOp.resumeID = resumeID
 	cliOp.showVersion = showVersion
+}
+
+func registerTools(homeDir, workDir string) tools.Registry {
+	register := tools.NewRegistry()
+	tools := []tools.Tool{
+		tools.NewEditTool(workDir),
+		tools.NewReadTool(workDir),
+		tools.NewBashTool(workDir),
+		tools.NewWebSearchTool(),
+	}
+	for _, tool := range tools {
+		register.Register(tool)
+	}
+	return register
 }

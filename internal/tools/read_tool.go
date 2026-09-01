@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
@@ -17,6 +18,7 @@ const maxLineRead = 500        // 最大读取行数限制，防止一次性读�
 
 type ReadTool struct {
 	schema.ToolDefinition
+	workDir string
 }
 
 type readToolInput struct {
@@ -26,9 +28,10 @@ type readToolInput struct {
 	Limit     int    `json:"limit,omitempty"`
 	Offset    int64  `json:"offset,omitempty"`
 }
+type ReadToolOption func(*ReadTool)
 
-func NewReadTool() *ReadTool {
-	return &ReadTool{
+func NewReadTool(workDir string, options ...ReadToolOption) *ReadTool {
+	t := &ReadTool{
 		ToolDefinition: schema.ToolDefinition{
 			Name: "read_tool",
 			Description: "读取指定路径的文件内容。" +
@@ -63,6 +66,12 @@ func NewReadTool() *ReadTool {
 			},
 		},
 	}
+	t.workDir = workDir
+	for _, opt := range options {
+		opt(t)
+	}
+
+	return t
 }
 
 func (t *ReadTool) GetDefinition() schema.ToolDefinition {
@@ -78,6 +87,7 @@ func (t *ReadTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 		return "", fmt.Errorf("file_path 参数不能为空")
 	}
 
+	params.FilePath = filepath.Join(t.workDir, params.FilePath)
 	content, err := readFileContent(params)
 	if err != nil {
 		return "", fmt.Errorf("读取文件内容失败: %v", err)
