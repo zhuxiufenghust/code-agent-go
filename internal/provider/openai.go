@@ -2,11 +2,14 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/shared"
 
 	"github.com/tidwall/gjson"
 	"github.com/zhuxiufenghust/code-agent-go/internal/base"
@@ -59,6 +62,12 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, msgs []schema.Messa
 	reqParams := openai.ChatCompletionNewParams{
 		Model:    p.config.Model,
 		Messages: openaiMsgs,
+	}
+
+	// 将可用工具定义下发给模型，否则模型无法发起原生 function calling，
+	// 只能把工具调用以文本形式塞进 Content，导致 agent_loop 判定无 tool_call 而退出。
+	if tools := p.convertTools(availableTools); tools != nil {
+		reqParams.Tools = tools
 	}
 
 	stream := p.client.Chat.Completions.NewStreaming(ctx, reqParams)
@@ -141,6 +150,37 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, msgs []schema.Messa
 	})
 
 	return ch, nil
+}
+
+// convertTools 将内部工具定义转换为 OpenAI 原生 tools 参数。
+// InputSchema 为任意 JSON-schema 结构（本仓库工具使用 map[string]interface{}），
+// 先序列化为 JSON 再反序列化为 FunctionParameters（即 map[string]any），避免类型断言失败。
+func (p *OpenAIProvider) convertTools(tools []schema.ToolDefinition) []openai.ChatCompletionToolUnionParam {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]openai.ChatCompletionToolUnionParam, 0, len(tools))
+	for _, t := range tools {
+		var params shared.FunctionParameters
+		if t.InputSchema != nil {
+			if b, err := json.Marshal(t.InputSchema); err == nil {
+				_ = json.Unmarshal(b, &params)
+			}
+		}
+		if params == nil {
+			params = shared.FunctionParameters{}
+		}
+		out = append(out, openai.ChatCompletionToolUnionParam{
+			OfFunction: &openai.ChatCompletionFunctionToolParam{
+				Function: shared.FunctionDefinitionParam{
+					Name:        t.Name,
+					Description: param.NewOpt(t.Description),
+					Parameters:  params,
+				},
+			},
+		})
+	}
+	return out
 }
 
 func extractReasoningContent(rawJSON string) string {

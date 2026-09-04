@@ -35,9 +35,9 @@ func NewRegistry() Registry {
 	}
 }
 
-var registry = &registryImpl{
-	tools: make(map[string]Tool),
-}
+// var registry = &registryImpl{
+// 	tools: make(map[string]Tool),
+// }
 
 func (r *registryImpl) Register(tool Tool) error {
 	def := tool.GetDefinition()
@@ -55,8 +55,8 @@ func (r *registryImpl) Register(tool Tool) error {
 }
 
 func (r *registryImpl) GetAvailableTools() []schema.ToolDefinition {
-	defs := make([]schema.ToolDefinition, 0, len(registry.tools))
-	for _, tool := range registry.tools {
+	defs := make([]schema.ToolDefinition, 0, len(r.tools))
+	for _, tool := range r.tools {
 		defs = append(defs, tool.GetDefinition())
 	}
 	return defs

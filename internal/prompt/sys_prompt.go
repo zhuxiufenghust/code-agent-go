@@ -30,9 +30,11 @@ func BuildSystemPrompt(workDir string, tools []schema.ToolDefinition) string {
 	basePrompt := strings.ReplaceAll(SystemPromptTemplate, "{{.WorkDir}}", workDir)
 
 	var sb strings.Builder
-	sb.WriteString(toolsListPrefix)
-	for _, tool := range tools {
-		sb.WriteString("- " + tool.Name + ": " + tool.Description + "\n")
+	if len(tools) > 0 {
+		sb.WriteString(toolsListPrefix)
+		for _, tool := range tools {
+			sb.WriteString("- " + tool.Name + ": " + tool.Description + "\n")
+		}
 	}
 	return basePrompt + sb.String()
 }
