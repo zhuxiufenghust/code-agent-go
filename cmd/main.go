@@ -13,6 +13,7 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
 	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
+	"github.com/zhuxiufenghust/code-agent-go/internal/skill"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tui"
 
@@ -154,8 +155,10 @@ func registerTools(homeDir, workDir string) tools.Registry {
 	tools := []tools.Tool{
 		tools.NewEditTool(workDir),
 		tools.NewReadTool(workDir),
+		tools.NewWriteTool(workDir),
 		tools.NewBashTool(workDir),
 		tools.NewWebSearchTool(),
+		skill.NewSkillDispatcher(skill.NewSkillLoader(homeDir, workDir)),
 	}
 	for _, tool := range tools {
 		register.Register(tool)

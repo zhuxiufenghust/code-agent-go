@@ -124,7 +124,7 @@ func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts
 }
 
 func (e *AgentEngine) buildSystemPrompt() string {
-	return prompt.BuildSystemPrompt(e.workDir)
+	return prompt.BuildSystemPrompt(e.workDir, e.registry.GetAvailableTools())
 }
 
 // 加载历史上下文消息，返回包含系统提示、历史消息和当前用户输入的完整对话上下文。
@@ -261,7 +261,7 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 		llmContext = append(llmContext, *rspMsg)
 		log.Info("llm_call_succ ", zap.Int("turn", turnCount), zap.String("role", string(rspMsg.Role)), zap.String("msg_out", rspMsg.Content),
 			zap.Int("input_tokens", usage.InputTokens), zap.Int("output_tokens", usage.OutputTokens),
-			zap.Duration("llm_elapsed", llmElapsed))
+			zap.Duration("llm_elapsed", llmElapsed), zap.Int("tool_calls", len(rspMsg.ToolCalls)))
 
 		// no more tool calls, loop ends
 		if len(rspMsg.ToolCalls) == 0 {

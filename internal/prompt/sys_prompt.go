@@ -1,6 +1,10 @@
 package prompt
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
+)
 
 const SystemPromptTemplate = `You are a helpful and efficient AI code agent. 
 Your task is to assist the user in achieving their goals by providing accurate and relevant information, executing tools, and generating responses based on the conversation history.
@@ -20,6 +24,17 @@ Your task is to assist the user in achieving their goals by providing accurate a
 你的工作目录是 {{.WorkDir}}. 你只能访问此目录及其子目录中的文件。你不能访问此目录之外的文件。
 `
 
-func BuildSystemPrompt(workDir string) string {
-	return strings.ReplaceAll(SystemPromptTemplate, "{{.WorkDir}}", workDir)
+const toolsListPrefix = "\n你可以使用以下工具：\n"
+
+func BuildSystemPrompt(workDir string, tools []schema.ToolDefinition) string {
+	basePrompt := strings.ReplaceAll(SystemPromptTemplate, "{{.WorkDir}}", workDir)
+
+	var sb strings.Builder
+	if len(tools) > 0 {
+		sb.WriteString(toolsListPrefix)
+		for _, tool := range tools {
+			sb.WriteString("- " + tool.Name + ": " + tool.Description + "\n")
+		}
+	}
+	return basePrompt + sb.String()
 }
