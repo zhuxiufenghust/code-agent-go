@@ -68,6 +68,7 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 			ToolCallID: call.ID,
 			IsError:    true,
 			Output:     fmt.Sprintf("tool %s not found", call.Name),
+			Name:       call.Name,
 		}
 	}
 
@@ -78,6 +79,7 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 				ToolCallID: call.ID,
 				Output:     fmt.Sprintf("Error: 工具 '%s' 执行时发生 panic: %v", call.Name, rec),
 				IsError:    true,
+				Name:       call.Name,
 			}
 		}
 	}()
@@ -88,12 +90,14 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 			ToolCallID: call.ID,
 			IsError:    true,
 			Output:     err.Error(),
+			Name:       call.Name,
 		}
 	} else {
 		result = schema.ToolResult{
 			ToolCallID: call.ID,
 			Output:     output,
 			IsError:    false,
+			Name:       call.Name,
 		}
 	}
 	return result

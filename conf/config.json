@@ -13,5 +13,8 @@
         "apiKeyEnv": "TEST_OPENAI_API_KEY",
         "options": {
         }
+    },
+    "engine": {
+        "maxConcurrentTools": 10
     }
 }

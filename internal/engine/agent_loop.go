@@ -6,10 +6,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhuxiufenghust/code-agent-go/internal/context_mng"
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
 	"github.com/zhuxiufenghust/code-agent-go/internal/memory"
-	"github.com/zhuxiufenghust/code-agent-go/internal/prompt"
 	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
@@ -24,6 +24,7 @@ type AgentEngine struct {
 	provider provider.LLMProvider
 	registry tools.Registry
 	session  memory.Session // 可选，nil 表示无持久化
+	recovery *context_mng.RecoveryManager
 
 	maxConcurrentTools int
 	toolTimeout        time.Duration
@@ -37,11 +38,18 @@ type AgentEngine struct {
 
 	memory             memory.Session // 可选，nil 表示无持久化
 	maxHistoryMsgLimit int            // 历史消息最大保留条数，超过则丢弃最旧的消息
+
+	maxLoopTurns int // 可选，限制单次 runLoop 最大轮次，0 表示无限制
 }
 
 func WithToolTimeout(timeout time.Duration) Option {
 	return func(e *AgentEngine) {
 		e.toolTimeout = timeout
+	}
+}
+func WithMaxLoopTurns(max int) Option {
+	return func(e *AgentEngine) {
+		e.maxLoopTurns = max
 	}
 }
 
@@ -105,6 +113,7 @@ func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts
 	engine := &AgentEngine{
 		provider: provider,
 		registry: registry,
+		recovery: context_mng.NewRecoveryManager(),
 	}
 	for _, opt := range opts {
 		opt(engine)
@@ -124,7 +133,7 @@ func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts
 }
 
 func (e *AgentEngine) buildSystemPrompt() string {
-	return prompt.BuildSystemPrompt(e.workDir, e.registry.GetAvailableTools())
+	return context_mng.BuildSystemPrompt(e.workDir, e.registry.GetAvailableTools())
 }
 
 // 加载历史上下文消息，返回包含系统提示、历史消息和当前用户输入的完整对话上下文。
@@ -247,6 +256,11 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 		zap.Int("start_index", startIndex), zap.String("history_msgs", logfmt.FormatMsgs(llmContext[:len(llmContext)-1])))
 	for {
 		turnCount++
+		if e.maxLoopTurns > 0 && turnCount > e.maxLoopTurns {
+			log.Warn("max loop turns reached", zap.Int("turn", turnCount), zap.String("session_id", e.sessionID),
+				zap.String("history_msgs", logfmt.FormatMsgs(llmContext)))
+			break
+		}
 
 		llmStartTime := time.Now()
 
@@ -269,14 +283,22 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			break
 		}
 
-		toolStart := time.Now()
 		results := e.executeTools(ctx, turnCount, rspMsg.ToolCalls, logPrefix, em)
-		toolElapsed := time.Since(toolStart)
-		hasErr := false
 		for _, res := range results {
+			finalOutput := res.Output
 			if res.IsError {
-				hasErr = true
-				log.Error("tool_call_failed", zap.Int("turn", turnCount), zap.String("tool_call_id", res.ToolCallID), zap.String("tool_name", res.Name), zap.String("output", res.Output))
+				log.Error("tool_call_failed", zap.Int("turn", turnCount), zap.String("tool_call_id", res.ToolCallID),
+					zap.String("tool_name", res.Name), zap.String("output", res.Output))
+				finalOutput = e.recovery.AnalyzeAndInject(ctx, res.Name, res.Output)
+				// 自愈提示注入观测：当返回内容与原错误不一致时，说明 RecoveryManager 命中并注入了 [系统救援指南]，
+				// 便于端到端验证时从日志确认 recover 机制是否生效。
+				if finalOutput != res.Output {
+					log.Info("recovery_hint_injected", zap.Int("turn", turnCount),
+						zap.String("tool_name", res.Name), zap.String("hint", finalOutput))
+				}
+			} else {
+				log.Info("tool_call_succ", zap.Int("turn", turnCount), zap.String("tool_call_id", res.ToolCallID),
+					zap.String("tool_name", res.Name), zap.String("output", res.Output))
 			}
 
 			content := res.Output
@@ -285,16 +307,12 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			}
 			llmContext = append(llmContext, schema.Message{
 				Role:       schema.UserRole,
-				Content:    content,
+				Content:    finalOutput,
 				ToolCallID: res.ToolCallID,
 				// 透传结构化错误信号，供 Provider 设置 tool_result.is_error，强化自愈。
 				IsError: res.IsError,
 			})
 		}
-		if hasErr {
-			return errToolCallFailed
-		}
-		log.Info("tool_call_succ", zap.Int("turn", turnCount), zap.Duration("tool_elapsed", toolElapsed))
 	}
 	e.SaveHistoryContext(ctx, llmContext, startIndex)
 

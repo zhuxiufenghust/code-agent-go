@@ -35,6 +35,16 @@ type OpenAIConfig struct {
 type Config struct {
 	Log    *LogConfig    `json:"log"`    // 日志相关配置
 	OpenAI *OpenAIConfig `json:"openai"` // OpenAI 相关配置
+	Engine *EngineConfig `json:"engine"` // AgentEngine 相关配置
+	LTM    *LtmConfig    `json:"ltm"`    // LTM 相关配置
+	Memory *MemoryConfig `json:"memory"` // Memory 相关配置
+}
+type EngineConfig struct {
+	WorkDir            string        `json:"workDir" yaml:"workDir"`
+	MaxHistoryMsgs     int           `json:"maxHistoryMsgs" yaml:"maxHistoryMsgs"`
+	MaxLoopTurns       int           `json:"maxLoopTurns" yaml:"maxLoopTurns"`
+	ToolTimeout        time.Duration `json:"toolTimeout" yaml:"toolTimeout"`
+	MaxConcurrentTools int           `json:"maxConcurrentTools" yaml:"maxConcurrentTools"`
 }
 type LtmConfig struct {
 	// Add fields for LTM configuration here
