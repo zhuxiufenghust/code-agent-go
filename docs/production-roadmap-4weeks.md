@@ -55,7 +55,12 @@
   - 涉及：`internal/engine/agent_loop.go`
 
 - **D3 工具输出截断**
-  - 在 `registry.Execute` 或 `executeTools` 处对 `res.Output` 做上限截断（默认 20KB / 可配），超限尾部追加 `...[已截断，共 N 字节]` 并建议改用 `read` 分段查看。
+  - 在 `registry.Execute` 或 `executeTools` 处对 `res.Output` 做**统一上限截断**（默认 20KB / 可配），超限仅保留前缀并在尾部追加 `...[已截断，共 N 字节]`。
+  - 截断对**所有工具**生效，但**提示文案必须按工具类型区分**，避免对 `bash` 输出提示「用 read 分段查看」这类无效建议：
+    - `read_tool`：提示用 `start_line`/`end_line` 或 `offset`/`limit` 重新读取所需片段；
+    - `bash_tool`：提示用 `head`/`tail`/`grep`/`sed` 过滤，或将输出重定向到文件后用 `read` 分段查看；
+    - `web_fetch_tool` / `web_search_tool`：提示缩小范围或改用更精确的 query；
+    - 其它工具：给出「缩小请求范围 / 分多次获取」通用兜底。
   - 涉及：`internal/tools/registry.go`、`internal/engine/agent_loop.go`
 
 - **D4 危险命令拦截（DangerHook 雏形）**

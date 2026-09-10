@@ -38,6 +38,7 @@ type Config struct {
 	Engine *EngineConfig `json:"engine"` // AgentEngine 相关配置
 	LTM    *LtmConfig    `json:"ltm"`    // LTM 相关配置
 	Memory *MemoryConfig `json:"memory"` // Memory 相关配置
+	Skill  *SkillConfig  `json:"skill"`  // Skill 相关配置
 }
 type EngineConfig struct {
 	WorkDir            string        `json:"workDir" yaml:"workDir"`
@@ -51,6 +52,9 @@ type LtmConfig struct {
 }
 
 type MemoryConfig struct {
+}
+type SkillConfig struct {
+	// Add fields for Skill configuration here
 }
 
 func LoadConfig(path string) (*Config, error) {

@@ -42,17 +42,19 @@ func (l *SkillLoader) GetSkillMap() map[string]schema.Skill {
 }
 
 func (l *SkillLoader) LoadSkills() error {
-	skills, err := l.LoadSkillFromDir(l.homeDir)
+	userskillDir := filepath.Join(l.homeDir, ".config/code-agent-go/skills")
+	skills, err := l.LoadSkillFromDir(userskillDir)
 	if err != nil {
-		return err
+		log.Warn("load skill from skill dir failed", zap.String("skill_dir", userskillDir))
 	}
 	skillMap := make(map[string]schema.Skill)
 	for _, skill := range skills {
 		skillMap[skill.Name] = skill
 	}
-	skills, err = l.LoadSkillFromDir(l.workDir)
+	workDirSkills := filepath.Join(l.workDir, ".config/code-agent-go/skills")
+	skills, err = l.LoadSkillFromDir(workDirSkills)
 	if err != nil {
-		return err
+		log.Warn("load skill from skill dir failed", zap.String("skill_dir", workDirSkills))
 	}
 	for _, skill := range skills {
 		if _, exists := skillMap[skill.Name]; exists {

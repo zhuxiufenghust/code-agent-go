@@ -77,7 +77,8 @@ func main() {
 
 	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
 		engine.WithHomeDir(homeDir),
-		engine.WithSessionID(sessID))
+		engine.WithSessionID(sessID), engine.WithMaxLoopTurns(cfg.Engine.MaxLoopTurns),
+	)
 
 	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent),
 		tea.WithAltScreen(),
