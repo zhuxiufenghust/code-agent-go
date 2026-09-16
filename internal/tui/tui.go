@@ -90,6 +90,13 @@ type tuiModel struct {
 	// 逐个弹出、逐个把决策回传引擎。“是否处于弹窗态”由队列长度推导，
 	// 不再单独存 bool，避免出现第二个状态源导致两者不一致。
 	dialogs []ConfirmDialogModel
+	// approvalSeq / approvalDone 记录本轮（一次用户输入触发的运行）内
+	// 累计收到 / 已处理的审批请求数，用于算出"当前是第几项"：
+	// 每条弹窗按序号在屏幕上错位显示，避免用户误以为是上一条没提交成功、界面卡住。
+	// 注意不能按"队列长度"算序号：并发请求的第二条事件往往在第一条解析后才送达，
+	// 队列里通常只有 1 条，那样算出来永远是第 1 项，也就永远不会有位移。
+	approvalSeq  int
+	approvalDone int
 	// approval 由 main 注入（可能为 nil，未开启审批时），保留引用便于退出时清理待审批任务。
 	approval *tools.ApprovalManager
 }
@@ -152,6 +159,18 @@ func (m tuiModel) dialogOpen() bool { return len(m.dialogs) > 0 }
 // currentDialog 返回队首（正在展示）的对话框；调用前必须确保 dialogOpen()。
 func (m tuiModel) currentDialog() ConfirmDialogModel { return m.dialogs[0] }
 
+// currentDialogOrdinal 返回当前对话框是"本轮第几项"（0 开始），
+// 即本轮已处理掉的审批请求数：第一条为 0，之后每处理一条 +1。
+func (m tuiModel) currentDialogOrdinal() int { return m.approvalDone }
+
+// resetApprovalProgress 在本轮运行开始/结束时清零审批进度，
+// 使下一轮的弹窗重新从初始位置开始错位。
+func (m tuiModel) resetApprovalProgress() tuiModel {
+	m.approvalSeq = 0
+	m.approvalDone = 0
+	return m
+}
+
 // resolveApproval 把 id 对应审批请求的决策回传给正在等待的引擎 goroutine，并出队。
 // ResultChannel 由引擎侧创建且缓冲容量为 1，发送不会阻塞；TUI 是唯一发送者，
 // 因此发送后由这里关闭 channel，引擎侧即便只读 ctx 也能通过 ok==false 感知取消。
@@ -177,6 +196,7 @@ func (m tuiModel) resolveApproval(id string, allowed bool, reason string) tuiMod
 		close(ar.ResultChannel)
 	}
 	m.dialogs = append(m.dialogs[:idx], m.dialogs[idx+1:]...)
+	m.approvalDone++
 	return m
 }
 
@@ -396,6 +416,7 @@ func (m tuiModel) handleEvent(evt engine.Event) (tea.Model, tea.Cmd) {
 		m.dialogs = append(m.dialogs, NewConfirmDialogModel(ar.TaskID,
 			fmt.Sprintf("需要审批: %s\n原因: %s", ar.ToolCall.Name, ar.Reason),
 			ar))
+		m.approvalSeq++
 		if len(m.dialogs) == 1 {
 			m.textarea.Blur() // 首个请求才需要交出输入焦点
 		}
@@ -429,6 +450,7 @@ func (m tuiModel) handleEvent(evt engine.Event) (tea.Model, tea.Cmd) {
 		// 本轮已结束：还在队列里的审批请求已无人决策，全部按拒绝回传，
 		// 否则对应的工具 goroutine 会一直挂到审批超时。
 		m = m.rejectAllPending("运行已结束，审批取消")
+		m = m.resetApprovalProgress() // 本轮结束，下一轮弹窗重新从初始位置开始
 		m.textarea.Focus()
 		// 出错也视为本轮结束，取消流式 context，避免 goroutine/连接泄漏。
 		if m.cancel != nil {
@@ -445,6 +467,7 @@ func (m tuiModel) handleEvent(evt engine.Event) (tea.Model, tea.Cmd) {
 		// 正常情况下队列应已清空；若仍有残留（例如引擎提前结束），
 		// 一律按拒绝回传，避免 goroutine 悬挂。
 		m = m.rejectAllPending("运行已结束，审批取消")
+		m = m.resetApprovalProgress() // 本轮结束，下一轮弹窗重新从初始位置开始
 		// 流式运行结束，取消其 context，释放底层连接与 goroutine。
 		if m.cancel != nil {
 			m.cancel()
@@ -494,6 +517,8 @@ func (m tuiModel) streamRun(userPrompt string) (tea.Model, tea.Cmd) {
 	log.Debug("tui_stream_run", zap.String("user_prompt", userPrompt))
 
 	m.eventCh = ch
+	// 新一轮开始：审批进度归零，弹窗从初始位置开始逐条错位。
+	m = m.resetApprovalProgress()
 	return m, readNextEvent(ch)
 }
 
@@ -623,15 +648,36 @@ func (m tuiModel) footerHeight() int {
 	return lipgloss.Height(m.footer())
 }
 
-// dialogView 渲染当前对话框；队列里还有更多待审批时，在下方提示剩余数量，
-// 否则用户会以为只剩眼前这一条，也无法判断还要操作几次。
+// dialogView 渲染当前对话框：附带"第 k 项（共 N 项）"进度提示，
+// 让用户知道这是本轮第几次审批、后面还有几条，而不是以为卡在同一条上。
 func (m tuiModel) dialogView() string {
 	view := m.currentDialog().View()
-	if n := len(m.dialogs); n > 1 {
+	k := m.currentDialogOrdinal() + 1 // 当前是第几项（1 开始）
+	n := len(m.dialogs)
+	switch {
+	case n > 1:
+		// 队列里已积压多条（引擎先于用户决策送达）：显示 k/(k+n-1)
 		view = lipgloss.JoinVertical(lipgloss.Center, view,
-			thinkingHeaderStyle.Render(fmt.Sprintf("还有 %d 项待审批（Esc 仅取消当前项）", n-1)))
+			thinkingHeaderStyle.Render(fmt.Sprintf("第 %d/%d 项待审批（Esc 仅取消当前项）", k, k+n-1)))
+	case k > 1:
+		// 本轮已经处理过至少一条：强调"这是新的一条"，不是上一条卡住了
+		view = lipgloss.JoinVertical(lipgloss.Center, view,
+			thinkingHeaderStyle.Render(fmt.Sprintf("第 %d 项审批（上一项已处理，Esc 仅取消当前项）", k)))
 	}
 	return view
+}
+
+// dialogShiftStyle 给出当前弹窗的屏幕错位样式：每处理一项就往右下挪一点，
+// 使"下一条"在视觉上明显区别于上一条，避免用户误以为上一条没有提交成功、界面卡住。
+// 注意：lipgloss.Place 会把内容整体居中，因此左右/上下外边距都取"位移的 2 倍"，
+// 才能让可见的弹窗实际位移 x/y；位移量按 maxStep 取模循环，避免越挪越偏出屏幕。
+func (m tuiModel) dialogShiftStyle() lipgloss.Style {
+	const (
+		stepX, stepY = 4, 2 // 每项的位移（列、行）
+		maxStep      = 4    // 位移步数上限，超过后回到起点循环
+	)
+	n := m.currentDialogOrdinal() % maxStep
+	return lipgloss.NewStyle().MarginLeft(2 * n * stepX).MarginTop(2 * n * stepY)
 }
 
 func (m tuiModel) View() string {
@@ -651,7 +697,8 @@ func (m tuiModel) View() string {
 			h = 24
 		}
 		// 审批弹窗以模态形式居中显示（基于空白背景），关闭后恢复主界面。
-		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, m.dialogView())
+		// 同一批有多条时逐条错位，提示"这是新的一条"。
+		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, m.dialogShiftStyle().Render(m.dialogView()))
 	}
 	return base
 }
