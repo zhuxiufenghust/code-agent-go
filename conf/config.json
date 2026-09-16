@@ -17,6 +17,10 @@
     "engine": {
         "maxConcurrentTools": 10
     },
+    "tool": {
+        "enableApproval": true,
+        "dangerCmds": ["ls -la", "rm -rf *", "ls"]
+    },
     "skill": {
     }
 }

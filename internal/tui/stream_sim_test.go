@@ -19,7 +19,7 @@ func init() {
 // TestActionAccumulatesImmediately 验证：每个增量 delta 到达后立即拼接进同一正文块并渲染，
 // 收到多少显示多少（网关逐 token 流式则逐字出现；整块到达则整块拼接，无延迟/动画）。
 func TestActionAccumulatesImmediately(t *testing.T) {
-	m := New("/tmp", "test-model", nil)
+	m := New("/tmp", "test-model", nil, nil)
 	m.width = 100
 
 	ch := make(chan engine.Event)

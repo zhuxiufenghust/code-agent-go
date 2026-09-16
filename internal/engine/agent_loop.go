@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
 	"github.com/zhuxiufenghust/code-agent-go/internal/memory"
 	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
+	"github.com/zhuxiufenghust/code-agent-go/internal/report"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
 	"go.uber.org/zap"
@@ -39,7 +42,9 @@ type AgentEngine struct {
 	memory             memory.Session // 可选，nil 表示无持久化
 	maxHistoryMsgLimit int            // 历史消息最大保留条数，超过则丢弃最旧的消息
 
-	maxLoopTurns int // 可选，限制单次 runLoop 最大轮次，0 表示无限制
+	maxLoopTurns int            // 可选，限制单次 runLoop 最大轮次，0 表示无限制
+	emitter      report.Emitter // 可选，事件回调接口
+
 }
 
 func WithToolTimeout(timeout time.Duration) Option {
@@ -90,23 +95,8 @@ func WithSessionID(sessID string) Option {
 	}
 }
 
-type emitter struct {
-	// generate 执行一次 LLM 调用，返回响应 Message 和实际 token 用量（可能为 nil）。
-	generate  func(ctx context.Context, turn int, history []schema.Message, tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error)
-	toolStart func(turn int, tc schema.ToolCall)
-	toolDone  func(turn int, tc schema.ToolCall, result schema.ToolResult, d time.Duration)
-	// tokenUpdate 报告当前 context 的 token 用量。
-	// 在 LLM 调用前以估算值调用；调用后若有实际用量则以实际值再次调用。
-	// tokens = token 数；window = 模型 context window（0 表示未知）。
-	tokenUpdate func(tokens, window int)
-
-	// compaction 在上下文发生有效压缩时调用（token 数减少 > 5%）。
-	// compaction func(data CompactionData)
-
-	// approval 是人类审批回调，注入到工具执行 context 中。
-	// RunStream 模式下通过 EventApprovalRequired 事件驱动 TUI 审批对话框；
-	// Run（阻塞）模式下留 nil，HookActionAsk 视为 Allow（向后兼容）。
-	// approval hooks.ApprovalFunc
+func (e *AgentEngine) GetEmitter() report.Emitter {
+	return e.emitter
 }
 
 func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts ...Option) *AgentEngine {
@@ -130,6 +120,10 @@ func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts
 	}
 
 	return engine
+}
+
+func (e *AgentEngine) UpdateEmitter(em report.Emitter) {
+	e.emitter = em
 }
 
 func (e *AgentEngine) buildSystemPrompt() string {
@@ -172,7 +166,7 @@ func (e *AgentEngine) SaveHistoryContext(ctx context.Context, msgs []schema.Mess
 	}
 }
 
-func (e *AgentEngine) generateWithRetry(ctx context.Context, em emitter, turn int, history []schema.Message, toolDefs []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
+func (e *AgentEngine) generateWithRetry(ctx context.Context, turn int, history []schema.Message, toolDefs []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 	var rspMsg *schema.Message
 	var usage *schema.Usage
 	var err error
@@ -189,7 +183,7 @@ func (e *AgentEngine) generateWithRetry(ctx context.Context, em emitter, turn in
 	}
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
-		rspMsg, usage, err = em.generate(ctx, turn, history, toolDefs)
+		rspMsg, usage, err = e.emitter.Generate(ctx, turn, history, toolDefs)
 		if err == nil {
 			return rspMsg, usage, nil
 		}
@@ -201,7 +195,7 @@ func (e *AgentEngine) generateWithRetry(ctx context.Context, em emitter, turn in
 	return nil, nil, lastErr
 }
 
-func (e *AgentEngine) executeTools(ctx context.Context, turn int, toolCalls []schema.ToolCall, logPrefix string, em emitter) []schema.ToolResult {
+func (e *AgentEngine) executeTools(ctx context.Context, turn int, toolCalls []schema.ToolCall, logPrefix string) []schema.ToolResult {
 	results := make([]schema.ToolResult, len(toolCalls))
 	var wg sync.WaitGroup
 
@@ -226,17 +220,11 @@ func (e *AgentEngine) executeTools(ctx context.Context, turn int, toolCalls []sc
 				toolCtx, cancel = context.WithTimeout(ctx, e.toolTimeout)
 				defer cancel()
 			}
-
-			// TODO: 注入审批回调
-			// if em.approval != nil {
-			//	toolCtx = hooks.WithApprovalFn(toolCtx, em.approval)
-			// }
-
-			em.toolStart(turn, tc)
+			e.emitter.ToolStart(turn, tc)
 
 			start := time.Now()
 			results[idx] = e.registry.Execute(toolCtx, tc)
-			em.toolDone(turn, tc, results[idx], time.Since(start))
+			e.emitter.ToolDone(turn, tc, results[idx], time.Since(start))
 		}(i, toolCall)
 	}
 
@@ -244,13 +232,50 @@ func (e *AgentEngine) executeTools(ctx context.Context, turn int, toolCalls []sc
 	return results
 }
 
-func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string, em emitter) error {
+// stuckRepeatThreshold 是"连续重复相同工具调用"的判定阈值：
+// repeatCount 计的是"与上一轮相同的次数"，取 2 表示同一调用连续出现 3 轮即判定卡住，
+// 既不误伤自愈场景下的一次重试，也不会让死循环跑太久。
+const stuckRepeatThreshold = 2
+
+// toolCallsSignature 把一轮的工具调用序列化成可比对的签名（顺序敏感）。
+// 参数为空的调用（如纯文本轮）返回空串，不参与卡住判定。
+func toolCallsSignature(calls []schema.ToolCall) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range calls {
+		b.WriteString(c.Name)
+		b.WriteByte('(')
+		b.Write(c.Arguments)
+		b.WriteString(");")
+	}
+	return b.String()
+}
+
+func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string) error {
 
 	// TODO: 增加session加载历史消息
 
 	var turnCount int
 	tools := e.registry.GetAvailableTools()
 	llmContext, startIndex := e.LoadHistoryContext(ctx, userPrompt)
+
+	// finalize 是统一收尾：把终止原因作为"最终文本回复"写入上下文与会话，
+	// 并通过 emitter.Final 通知客户端（TUI 能看到"为什么停了"），而不是无声结束。
+	finalize := func(reason string) {
+		log.Warn("run_loop_stopped", zap.String("reason", reason), zap.Int("turn", turnCount),
+			zap.String("session_id", e.sessionID))
+		llmContext = append(llmContext, schema.Message{Role: schema.AssistantRole, Content: reason})
+		if e.emitter.Final != nil {
+			e.emitter.Final(reason)
+		}
+	}
+
+	// lastCallSig / repeatCount 用于"卡住检测"：连续多轮提交完全相同的
+	// (name+args) 说明模型在原地打转（或自愈失败），继续只会烧钱，必须终止。
+	var lastCallSig string
+	var repeatCount int
 
 	log.Info("run_loop_start", zap.String("user_prompt", userPrompt), zap.Int("history_msg_count", len(llmContext)-1),
 		zap.Int("start_index", startIndex), zap.String("history_msgs", logfmt.FormatMsgs(llmContext[:len(llmContext)-1])))
@@ -259,12 +284,13 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 		if e.maxLoopTurns > 0 && turnCount > e.maxLoopTurns {
 			log.Warn("max loop turns reached", zap.Int("turn", turnCount), zap.String("session_id", e.sessionID),
 				zap.String("history_msgs", logfmt.FormatMsgs(llmContext)))
+			finalize(fmt.Sprintf("[已停止] 达到最大轮次上限 %d 轮，任务未自然收敛。请缩小目标后重试。", e.maxLoopTurns))
 			break
 		}
 
 		llmStartTime := time.Now()
 
-		rspMsg, usage, err := e.generateWithRetry(ctx, em, turnCount, llmContext, tools)
+		rspMsg, usage, err := e.generateWithRetry(ctx, turnCount, llmContext, tools)
 		llmEndTime := time.Now()
 		llmElapsed := llmEndTime.Sub(llmStartTime)
 
@@ -272,9 +298,20 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			log.Error("llm_call_failed", zap.Int("turn", turnCount), zap.Error(err))
 			return err
 		}
+		// Emitter 约定：err 为 nil 时 Message 不应为 nil。这里兜住实现违规（或 mock），
+		// 否则下面的 *rspMsg 会空指针让整轮运行直接崩溃。
+		if rspMsg == nil {
+			log.Error("llm_returned_empty_msg", zap.Int("turn", turnCount))
+			return errors.New("llm 返回空响应")
+		}
 		llmContext = append(llmContext, *rspMsg)
+		// usage 允许为 nil（Emitter 约定：无实际用量时返回 nil），不能无条件解引用。
+		var inTokens, outTokens int
+		if usage != nil {
+			inTokens, outTokens = usage.InputTokens, usage.OutputTokens
+		}
 		log.Info("llm_call_succ ", zap.Int("turn", turnCount), zap.String("role", string(rspMsg.Role)), zap.String("msg_out", rspMsg.Content),
-			zap.Int("input_tokens", usage.InputTokens), zap.Int("output_tokens", usage.OutputTokens),
+			zap.Int("input_tokens", inTokens), zap.Int("output_tokens", outTokens),
 			zap.Duration("llm_elapsed", llmElapsed), zap.Int("tool_calls", len(rspMsg.ToolCalls)))
 
 		// no more tool calls, loop ends
@@ -283,7 +320,22 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			break
 		}
 
-		results := e.executeTools(ctx, turnCount, rspMsg.ToolCalls, logPrefix, em)
+		// 卡住检测：与上一轮的 (name+args) 完全相同则累加，达到阈值即判定卡住。
+		if sig := toolCallsSignature(rspMsg.ToolCalls); sig != "" && sig == lastCallSig {
+			repeatCount++
+		} else {
+			repeatCount = 0
+		}
+		lastCallSig = toolCallsSignature(rspMsg.ToolCalls)
+		if repeatCount >= stuckRepeatThreshold {
+			log.Warn("stuck_detected", zap.Int("turn", turnCount), zap.Int("repeat", repeatCount),
+				zap.String("signature", lastCallSig), zap.String("session_id", e.sessionID))
+			finalize(fmt.Sprintf("[已停止] 检测到连续 %d 轮重复提交完全相同的工具调用，判定为卡住。请换一种思路或补充信息后重试。",
+				repeatCount+1))
+			break
+		}
+
+		results := e.executeTools(ctx, turnCount, rspMsg.ToolCalls, logPrefix)
 		for _, res := range results {
 			finalOutput := res.Output
 			if res.IsError {
@@ -320,22 +372,25 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 }
 
 func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
-	em := emitter{
-		generate: func(ctx context.Context, turn int, history []schema.Message, tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
+	em := report.Emitter{
+		Generate: func(ctx context.Context, turn int, history []schema.Message, tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 			return e.provider.Generate(ctx, history, tools)
 		},
-		toolStart: func(turn int, tc schema.ToolCall) {
+		ToolStart: func(turn int, tc schema.ToolCall) {
 			log.Info("tool call done", zap.String("tool_call_id", tc.ID), zap.String("tool_name", tc.Name),
 				zap.String("arguments", logfmt.FormatJSON(tc.Arguments)))
 		},
-		toolDone: func(turn int, tc schema.ToolCall, result schema.ToolResult, d time.Duration) {
+		ToolDone: func(turn int, tc schema.ToolCall, result schema.ToolResult, d time.Duration) {
 			log.Info("tool call done", zap.String("tool_call_id", tc.ID), zap.String("tool_name", tc.Name), zap.Duration("duration", d),
 				zap.String("output", result.Output), zap.Bool("is_error", result.IsError))
 		},
-		tokenUpdate: func(tokens, window int) {
+		TokenUpdate: func(tokens, window int) {
 			panic("not imp")
 		},
+		// 阻塞模式没有事件流可以把审批请求送给人：ApprovalRequired 保持 nil，
+		// ApproveManager 会据此“默认放行”（向后兼容）。若在这里放一个必然返回 false
+		// 的空实现，反而会让高危命令在无人审批的场景下被静默拒绝。
 	}
-
-	return e.runLoop(ctx, userPrompt, "agent-run", em)
+	e.UpdateEmitter(em)
+	return e.runLoop(ctx, userPrompt, "agent-run")
 }

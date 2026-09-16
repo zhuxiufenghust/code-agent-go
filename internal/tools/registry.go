@@ -9,6 +9,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// MiddlewareFunc 定义了中间件的签名。
+// 它接收当前的 ToolCall，并返回一个是否允许执行的布尔值 (allowed)，以及拦截时的原因 (rejectReason)。
+type MiddlewareFunc func(ctx context.Context, call schema.ToolCall) (schema.ApprovalResult, error)
+
 type Registry interface {
 	// Register 将一个 BaseTool 实现注册到工具表中。
 	// 若已存在同名工具，返回 error；原有工具保持不变。
@@ -18,6 +22,8 @@ type Registry interface {
 	// GetAvailableTools 返回所有已注册工具的 ToolDefinition 列表，
 	// 供 LLM 在 Generate 调用时了解可用工具集。
 	GetAvailableTools() []schema.ToolDefinition
+
+	Use(mw MiddlewareFunc)
 
 	// Execute 根据 ToolCall 中的工具名称查找并执行对应工具，
 	// 返回封装后的 ToolResult（包含输出或错误信息）。
@@ -31,6 +37,7 @@ const defaultMaxToolOutput = 20 * 1024
 type registryImpl struct {
 	tools         map[string]Tool
 	maxOutputSize int
+	middlewares   []MiddlewareFunc // 【新增】保存挂载的中间件链
 }
 
 // WithMaxOutputSize 设置工具输出截断上限(字节),覆盖默认值 defaultMaxToolOutput。
@@ -50,6 +57,7 @@ func NewRegistry(options ...RegistryOption) Registry {
 	r := &registryImpl{
 		tools:         make(map[string]Tool),
 		maxOutputSize: defaultMaxToolOutput,
+		middlewares:   make([]MiddlewareFunc, 0),
 	}
 	for _, opt := range options {
 		opt(r)
@@ -83,6 +91,12 @@ func (r *registryImpl) GetAvailableTools() []schema.ToolDefinition {
 	}
 	return defs
 }
+func (r *registryImpl) Use(mw MiddlewareFunc) {
+	// 这里可以将中间件添加到中间件链中
+	// 例如：
+	r.middlewares = append(r.middlewares, mw)
+}
+
 func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
 	tool, exists := r.tools[call.Name]
 	if !exists {
@@ -105,6 +119,26 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 			}
 		}
 	}()
+
+	for _, mw := range r.middlewares {
+		result, err := mw(ctx, call)
+		if err != nil {
+			return schema.ToolResult{
+				ToolCallID: call.ID,
+				IsError:    true,
+				Output:     fmt.Sprintf("tool %s rejected by middleware: %v", call.Name, err),
+				Name:       call.Name,
+			}
+		}
+		if !result.Allowed {
+			return schema.ToolResult{
+				ToolCallID: call.ID,
+				IsError:    true,
+				Output:     fmt.Sprintf("tool %s rejected by middleware: %s", call.Name, result.Reason),
+				Name:       call.Name,
+			}
+		}
+	}
 
 	output, err := tool.Execute(ctx, call.Arguments)
 	if err != nil {
