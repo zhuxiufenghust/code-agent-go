@@ -13,5 +13,14 @@
         "apiKeyEnv": "TEST_OPENAI_API_KEY",
         "options": {
         }
+    },
+    "engine": {
+        "maxConcurrentTools": 10
+    },
+    "tool": {
+        "enableApproval": true,
+        "dangerCmds": ["ls -la", "rm -rf *", "ls"]
+    },
+    "skill": {
     }
 }

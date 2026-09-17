@@ -35,12 +35,50 @@ type OpenAIConfig struct {
 type Config struct {
 	Log    *LogConfig    `json:"log"`    // 日志相关配置
 	OpenAI *OpenAIConfig `json:"openai"` // OpenAI 相关配置
+	Engine *EngineConfig `json:"engine"` // AgentEngine 相关配置
+	LTM    *LtmConfig    `json:"ltm"`    // LTM 相关配置
+	Memory *MemoryConfig `json:"memory"` // Memory 相关配置
+	Skill  *SkillConfig  `json:"skill"`  // Skill 相关配置
+	Tool   *ToolConfig   `json:"tool"`   // Tool 相关配置
 }
+type EngineConfig struct {
+	WorkDir            string        `json:"workDir" yaml:"workDir"`
+	MaxHistoryMsgs     int           `json:"maxHistoryMsgs" yaml:"maxHistoryMsgs"`
+	MaxLoopTurns       int           `json:"maxLoopTurns" yaml:"maxLoopTurns"`
+	ToolTimeout        time.Duration `json:"toolTimeout" yaml:"toolTimeout"`
+	MaxConcurrentTools int           `json:"maxConcurrentTools" yaml:"maxConcurrentTools"`
+}
+
 type LtmConfig struct {
 	// Add fields for LTM configuration here
 }
 
 type MemoryConfig struct {
+}
+type SkillConfig struct {
+	// Add fields for Skill configuration here
+}
+
+const (
+	// DefaultMaxLoopTurns 是单轮 agent 循环的默认上限：
+	// 生产上必须有兜底，否则模型死循环会无限烧钱。配置为 0/缺省时取该值。
+	DefaultMaxLoopTurns = 30
+)
+
+// ApplyDefaults 为未配置的项补上生产可用的默认值，避免"配置缺一段"就等于"保护关闭"。
+// 目前负责：engine 段缺失时补空结构、maxLoopTurns 缺省时补 DefaultMaxLoopTurns。
+func (c *Config) ApplyDefaults() {
+	if c.Engine == nil {
+		c.Engine = &EngineConfig{}
+	}
+	if c.Engine.MaxLoopTurns <= 0 {
+		c.Engine.MaxLoopTurns = DefaultMaxLoopTurns
+	}
+}
+
+type ToolConfig struct {
+	DangerCmds     []string `json:"dangerCmds" yaml:"dangerCmds"`
+	EnableApproval bool     `json:"enableApproval" yaml:"enableApproval"`
 }
 
 func LoadConfig(path string) (*Config, error) {

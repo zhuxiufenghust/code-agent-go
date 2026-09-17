@@ -181,6 +181,29 @@ func TestBashTool_WithTimeoutOption(t *testing.T) {
 	}
 }
 
+// TestBashTool_TimeoutErrorContainsKeyword 验证超时错误携带"超时"关键字，
+// 以便 RecoveryManager 能识别并注入 [系统救援指南]（自愈提示）。
+func TestBashTool_TimeoutErrorContainsKeyword(t *testing.T) {
+	// 用 WithTimeout 设极短超时，命令实际会跑更久，必然超时
+	tool := NewBashTool(t.TempDir(), WithTimeout(300*time.Millisecond))
+	input, _ := json.Marshal(map[string]interface{}{"command": "sleep 2"})
+
+	start := time.Now()
+	_, err := tool.Execute(context.Background(), input)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("期望超时返回错误")
+	}
+	// 关键断言：错误必须包含"超时"关键字，供自愈逻辑识别
+	if !strings.Contains(err.Error(), "超时") {
+		t.Errorf("期望超时错误包含'超时'关键字以触发自愈提示, 实际: %q", err.Error())
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("超时控制似乎未生效，耗时 %v", elapsed)
+	}
+}
+
 func TestEffectiveTimeout(t *testing.T) {
 	// 未设置任何超时时，应回退到 defaultBashTimeout
 	base := NewBashTool(t.TempDir())

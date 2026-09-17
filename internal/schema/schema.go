@@ -1,6 +1,9 @@
 package schema
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Role string
 
@@ -49,4 +52,25 @@ type ToolDefinition struct {
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+}
+
+// ApprovalRequest 是 EventApprovalRequired 的事件载荷。
+// 引擎 goroutine 阻塞等待 TUI（或其他消费者）经由 ApprovalManager.Resolve 回传决策，
+// TaskID 用于把这次事件与后续的 Resolve 调用关联起来。
+type ApprovalRequest struct {
+	TaskID        string
+	ToolCall      ToolCall
+	Reason        string
+	RiskLevel     string
+	ResultChannel chan ApprovalResult
+	// Deadline 是本次人工审批的截止时间（零值表示不限时）。
+	// 由发起方根据等待超时计算，TUI 可据此显示倒计时，
+	// 超时未决策时发起方按“拒绝”处理，避免 goroutine 永久悬挂。
+	Deadline time.Time
+}
+
+// ApprovalResult 审批结果包装
+type ApprovalResult struct {
+	Allowed bool
+	Reason  string
 }

@@ -1,4 +1,4 @@
-package prompt
+package context_mng
 
 import (
 	"strings"

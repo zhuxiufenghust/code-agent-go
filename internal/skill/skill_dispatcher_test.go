@@ -23,7 +23,7 @@ func TestMain(m *testing.M) {
 // writeSkillDir 在 base 下创建一个名为 name 的技能目录，并写入合法的 SKILL.md。
 func writeSkillDir(t *testing.T, base, name, desc string) {
 	t.Helper()
-	dir := filepath.Join(base, name)
+	dir := filepath.Join(base, ".config/code-agent-go/skills", name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("创建技能目录失败: %v", err)
 	}

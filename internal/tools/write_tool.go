@@ -74,7 +74,7 @@ func (t *WriteTool) Execute(ctx context.Context, input json.RawMessage) (string,
 		return "", fmt.Errorf("content 参数不能为空")
 	}
 
-	fullPath := filepath.Join(t.workDir, params.FilePath)
+	fullPath := resolvePath(t.workDir, params.FilePath)
 
 	// 防止误覆盖已有文件：除非显式 overwrite=true，否则已存在文件直接报错。
 	if _, err := os.Stat(fullPath); err == nil && !params.Overwrite {

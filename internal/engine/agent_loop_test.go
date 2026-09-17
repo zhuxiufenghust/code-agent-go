@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -32,11 +34,11 @@ func TestMain(m *testing.M) {
 type fakeProvider struct {
 	mu sync.Mutex
 
-	genScript       []genStep
-	genIdx          int
-	genHistories    [][]schema.Message
-	genToolsets     [][]schema.ToolDefinition
-	genErr          error // 若设置，Generate 直接返回该错误（忽略脚本）
+	genScript    []genStep
+	genIdx       int
+	genHistories [][]schema.Message
+	genToolsets  [][]schema.ToolDefinition
+	genErr       error // 若设置，Generate 直接返回该错误（忽略脚本）
 
 	streamScript []streamStep
 	streamIdx    int
@@ -54,7 +56,7 @@ type streamStep struct {
 	thinking []string
 	// text 中的每个字符串作为独立的 StreamChunkTextDelta 逐块发出（正文增量）。
 	// 若为空且 msg.Content 非空，则退化为将 msg.Content 作为单块文本发出。
-	text []string
+	text  []string
 	usage *schema.Usage
 }
 
@@ -123,16 +125,24 @@ func copyMessages(in []schema.Message) []schema.Message {
 
 // fakeRegistry 是一个记录调用、可注入行为的工具注册表。
 type fakeRegistry struct {
-	mu        sync.Mutex
-	defs      []schema.ToolDefinition
-	executed  []schema.ToolCall
-	handler   func(ctx context.Context, call schema.ToolCall) (string, error)
+	mu          sync.Mutex
+	defs        []schema.ToolDefinition
+	executed    []schema.ToolCall
+	handler     func(ctx context.Context, call schema.ToolCall) (string, error)
+	middlewares []tools.MiddlewareFunc
 }
 
 func (r *fakeRegistry) Register(tool tools.Tool) error { return nil }
 
 func (r *fakeRegistry) GetAvailableTools() []schema.ToolDefinition {
 	return r.defs
+}
+func (r *fakeRegistry) Use(mw tools.MiddlewareFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// 这里可以将中间件添加到中间件链中
+	// 例如：
+	r.middlewares = append(r.middlewares, mw)
 }
 
 func (r *fakeRegistry) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
@@ -236,7 +246,8 @@ func TestRun_ToolThenFinal(t *testing.T) {
 	}
 }
 
-// TestRun_ToolError 验证工具失败时 Run 返回错误（触发 Self-Healing 终止）。
+// TestRun_ToolError 验证工具失败时走自愈链路而不是让 Run 失败：
+// 错误以 IsError=true 回灌给 LLM，由模型决定重试/换方式，工具失败 ≠ 运行失败。
 func TestRun_ToolError(t *testing.T) {
 	p := &fakeProvider{
 		genScript: []genStep{
@@ -254,8 +265,116 @@ func TestRun_ToolError(t *testing.T) {
 	}
 
 	e := engine.NewAgentEngine(p, reg)
-	if err := e.Run(context.Background(), "boom"); err == nil {
-		t.Fatal("工具失败后 Run 应返回错误")
+	if err := e.Run(context.Background(), "boom"); err != nil {
+		t.Fatalf("工具失败应回灌给 LLM 触发自愈，Run 不应返回错误: %v", err)
+	}
+
+	// 自愈链路：第二轮 Generate 的 history 必须带上 IsError 的工具结果，
+	// 否则模型看不到失败原因，自愈无从发生。
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// 注意：脚本只有 1 步，第二轮会走“脚本耗尽”分支而不递增 genIdx，
+	// 因此用每次调用都会追加的 genHistories 判断调用次数。
+	if len(p.genHistories) != 2 {
+		t.Fatalf("期望 Generate 调用 2 次（第二轮用于自愈）, 实际 %d", len(p.genHistories))
+	}
+	found := false
+	for _, m := range p.genHistories[1] {
+		if m.ToolCallID == "c1" && m.IsError {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("工具错误未以 IsError 回灌给 LLM，自愈链路断裂")
+	}
+}
+
+// TestStreamRun_MaxLoopTurns 验证达到最大轮次上限时 runLoop 主动收尾：
+// 不 panic、不无限循环，并通过 EventFinal 说明停止原因。
+func TestStreamRun_MaxLoopTurns(t *testing.T) {
+	const maxTurns = 2
+	// 脚本里放足够多轮工具调用（永远不返回最终文本），逼出轮次上限。
+	steps := make([]streamStep, 0, maxTurns+3)
+	for i := 0; i < maxTurns+3; i++ {
+		steps = append(steps, streamStep{msg: &schema.Message{
+			Role: schema.AssistantRole,
+			ToolCalls: []schema.ToolCall{
+				{ID: fmt.Sprintf("c%d", i), Name: "echo", Arguments: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i))},
+			},
+		}})
+	}
+	p := &fakeProvider{streamScript: steps}
+	reg := &fakeRegistry{
+		defs:    []schema.ToolDefinition{toolDef("echo", "echo tool")},
+		handler: func(ctx context.Context, call schema.ToolCall) (string, error) { return "echoed", nil },
+	}
+
+	e := engine.NewAgentEngine(p, reg, engine.WithMaxLoopTurns(maxTurns))
+	ch, err := e.StreamRun(context.Background(), "loop forever")
+	if err != nil {
+		t.Fatalf("StreamRun 返回错误: %v", err)
+	}
+	events, gotErr := collectEvents(ch)
+	if gotErr {
+		t.Fatal("达到轮次上限不应产生 error 事件")
+	}
+	var finalText string
+	for _, evt := range events {
+		if evt.Type == engine.EventFinal {
+			finalText, _ = evt.Data.(string)
+		}
+	}
+	if finalText == "" {
+		t.Fatal("达到轮次上限应通过 EventFinal 给出最终说明")
+	}
+	if !strings.Contains(finalText, "最大轮次") {
+		t.Fatalf("EventFinal 应说明是轮次上限导致停止, 实际: %q", finalText)
+	}
+	if len(reg.executed) > maxTurns {
+		t.Fatalf("工具执行次数应不超过轮次上限 %d, 实际 %d", maxTurns, len(reg.executed))
+	}
+}
+
+// TestStreamRun_StuckDetection 验证连续多轮提交完全相同的工具调用会被判定为卡住并终止。
+func TestStreamRun_StuckDetection(t *testing.T) {
+	// 5 轮完全相同的调用；maxLoopTurns 给足，确保是被"卡住检测"拦下而不是轮次上限。
+	steps := make([]streamStep, 0, 5)
+	for i := 0; i < 5; i++ {
+		steps = append(steps, streamStep{msg: &schema.Message{
+			Role: schema.AssistantRole,
+			ToolCalls: []schema.ToolCall{
+				{ID: "same", Name: "echo", Arguments: json.RawMessage(`{"x":1}`)},
+			},
+		}})
+	}
+	p := &fakeProvider{streamScript: steps}
+	reg := &fakeRegistry{
+		defs:    []schema.ToolDefinition{toolDef("echo", "echo tool")},
+		handler: func(ctx context.Context, call schema.ToolCall) (string, error) { return "echoed", nil },
+	}
+
+	e := engine.NewAgentEngine(p, reg, engine.WithMaxLoopTurns(30))
+	ch, err := e.StreamRun(context.Background(), "stuck")
+	if err != nil {
+		t.Fatalf("StreamRun 返回错误: %v", err)
+	}
+	events, gotErr := collectEvents(ch)
+	if gotErr {
+		t.Fatal("卡住终止不应产生 error 事件")
+	}
+	var finalText string
+	for _, evt := range events {
+		if evt.Type == engine.EventFinal {
+			finalText, _ = evt.Data.(string)
+		}
+	}
+	if !strings.Contains(finalText, "重复") {
+		t.Fatalf("应因重复调用卡住而终止, 实际: %q", finalText)
+	}
+	// 阈值 2：第 3 次提交相同调用时判定卡住（不再执行），故工具实际执行 2 轮，
+	// 远小于脚本提供的 5 轮，说明确实被卡住检测拦下。
+	if n := len(reg.executed); n != 2 {
+		t.Fatalf("期望执行 2 轮后判定卡住, 实际 %d", n)
 	}
 }
 

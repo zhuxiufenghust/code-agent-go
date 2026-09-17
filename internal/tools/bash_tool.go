@@ -115,6 +115,15 @@ func (t *BashTool) runLocal(ctx context.Context, cmd string) (string, error) {
 	c.Stderr = tmp
 	err = c.Run()
 	if err != nil {
+		// context 超时/取消时，进程被强杀，c.Run 返回的是 "signal: killed" 之类，
+		// 不含"超时"关键字，自愈提示无法识别。这里显式转译为带"超时"的错误，
+		// 便于 RecoveryManager 注入 [系统救援指南]。
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("执行命令失败（超时）：%w", err)
+		}
+		if ctx.Err() == context.Canceled {
+			return "", fmt.Errorf("执行命令失败（已取消）：%w", err)
+		}
 		return "", fmt.Errorf("执行命令失败：%w", err)
 	}
 	out, readErr := os.ReadFile(tmp.Name())

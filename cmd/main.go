@@ -72,12 +72,32 @@ func main() {
 	}
 	pr := provider.NewOpenAIProvider(cfg.OpenAI)
 	registry := registerTools(homeDir, workDir)
+	// 审批默认开启：只有在配置里显式关闭（tool 段存在且 enableApproval=false）才停用。
+	// 内置高危规则（internal/hooks）保证即使不配 dangerCmds 也有底线，
+	// 所以"配置缺失"应当等价于"保持防护"，而不是"关闭防护"。
+	enableApproval := cfg.Tool == nil || cfg.Tool.EnableApproval
+	var approvalMgr *tools.ApprovalManager
+	if enableApproval {
+		var dangerCmds []string
+		if cfg.Tool != nil {
+			dangerCmds = cfg.Tool.DangerCmds
+		}
+		approvalMgr = tools.NewApprovalManager(dangerCmds)
+		registry.Use(approvalMgr.WaitForApproval)
+		log.Info("工具审批已启用（内置高危规则 + 配置黑名单）", zap.Strings("danger_cmds", dangerCmds))
+	} else {
+		log.Warn("工具审批已被显式关闭：高危命令将直接执行")
+	}
 
 	sessID := uuid.New().String()
 
 	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
 		engine.WithHomeDir(homeDir),
-		engine.WithSessionID(sessID))
+		engine.WithSessionID(sessID), engine.WithMaxLoopTurns(cfg.Engine.MaxLoopTurns),
+	)
+	if approvalMgr != nil {
+		approvalMgr.SetEmitGetter(agent)
+	}
 
 	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent),
 		tea.WithAltScreen(),
@@ -127,6 +147,8 @@ func normalizeConfig() *config.Config {
 	if cfg.Log == nil {
 		cfg.NewDefaultLog()
 	}
+	// 补齐生产默认值（如循环轮次上限），避免配置缺项时保护被静默关闭。
+	cfg.ApplyDefaults()
 	return cfg
 }
 

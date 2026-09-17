@@ -55,10 +55,13 @@ func TestSkillLoader_LoadSkills_WorkDirOverridesHome(t *testing.T) {
 }
 
 func TestSkillLoader_LoadSkills_MissingDir(t *testing.T) {
-	// homeDir 指向不存在的目录，LoadSkillFromDir 应返回错误
+	// 技能目录不存在应为非致命：仅告警并跳过，不返回 error，技能表为空
 	loader := NewSkillLoader(filepath.Join(t.TempDir(), "no_such"), t.TempDir())
-	if err := loader.LoadSkills(); err == nil {
-		t.Fatal("期望读取不存在目录时返回错误")
+	if err := loader.LoadSkills(); err != nil {
+		t.Fatalf("缺失技能目录不应返回错误, 实际: %v", err)
+	}
+	if got := loader.GetSkillMap(); len(got) != 0 {
+		t.Errorf("缺失技能目录时技能表应为空, 实际 %d 个", len(got))
 	}
 }
 
@@ -67,7 +70,7 @@ func TestSkillLoader_LoadOneSkill_Valid(t *testing.T) {
 	writeSkillDir(t, base, "foo", "做foo")
 	loader := NewSkillLoader(base, t.TempDir())
 
-	skill, err := loader.LoadOneSkill(filepath.Join(base, "foo"))
+	skill, err := loader.LoadOneSkill(filepath.Join(base, ".config/code-agent-go/skills", "foo"))
 	if err != nil {
 		t.Fatalf("加载技能失败: %v", err)
 	}

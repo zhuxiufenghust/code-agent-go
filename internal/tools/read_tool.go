@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
@@ -87,7 +86,7 @@ func (t *ReadTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 		return "", fmt.Errorf("file_path 参数不能为空")
 	}
 
-	params.FilePath = filepath.Join(t.workDir, params.FilePath)
+	params.FilePath = resolvePath(t.workDir, params.FilePath)
 	content, err := readFileContent(params)
 	if err != nil {
 		return "", fmt.Errorf("读取文件内容失败: %v", err)

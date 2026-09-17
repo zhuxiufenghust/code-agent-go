@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
@@ -66,7 +65,7 @@ func (t *EditTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 	if err := json.Unmarshal(input, &editInput); err != nil {
 		return "", fmt.Errorf("解析输入参数失败: %w", err)
 	}
-	fullFilePath := filepath.Join(t.workDir, editInput.FilePath)
+	fullFilePath := resolvePath(t.workDir, editInput.FilePath)
 	if _, err := os.Stat(fullFilePath); os.IsNotExist(err) {
 		return "", fmt.Errorf("文件不存在: %s", fullFilePath)
 	}
