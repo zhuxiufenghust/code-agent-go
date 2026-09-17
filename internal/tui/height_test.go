@@ -13,7 +13,7 @@ func u2(m tuiModel, msg tea.Msg) tuiModel {
 }
 
 func TestViewportHeightAccountsForBox(t *testing.T) {
-	m := New("/tmp", "m", nil, nil)
+	m := New("/tmp", "m", nil)
 	termH := 30
 	m = u2(m, tea.WindowSizeMsg{Width: 100, Height: termH})
 

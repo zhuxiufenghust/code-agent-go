@@ -12,7 +12,7 @@ import (
 
 // 构造一个带空事件流的 model，便于直接驱动 handleEvent。
 func newTestModel() tuiModel {
-	m := New("/tmp", "test-model", nil, nil)
+	m := New("/tmp", "test-model", nil)
 	m.eventCh = make(chan engine.Event)
 	return m
 }

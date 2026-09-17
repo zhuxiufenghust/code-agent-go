@@ -99,7 +99,7 @@ func main() {
 		approvalMgr.SetEmitGetter(agent)
 	}
 
-	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent, approvalMgr),
+	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent),
 		tea.WithAltScreen(),
 		// 启用鼠标(含滚轮)捕获：滚轮事件会作为 tea.MouseWheelMsg 交给程序，
 		// 由 viewport 在应用内滚动，而不是让终端去滚自己的滚动历史（从而看不到启动前输出）。

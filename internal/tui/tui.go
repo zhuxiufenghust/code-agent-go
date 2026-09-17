@@ -15,7 +15,6 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
-	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
 	"go.uber.org/zap"
 )
 
@@ -97,8 +96,6 @@ type tuiModel struct {
 	// 队列里通常只有 1 条，那样算出来永远是第 1 项，也就永远不会有位移。
 	approvalSeq  int
 	approvalDone int
-	// approval 由 main 注入（可能为 nil，未开启审批时），保留引用便于退出时清理待审批任务。
-	approval *tools.ApprovalManager
 }
 
 // maxViewportLines 是 viewport 历史保留的最大行数，超出部分丢弃最旧的。
@@ -114,7 +111,7 @@ func statusInnerWidth(w int) int {
 	return w - decoration
 }
 
-func New(workDir string, modelName string, agent *engine.AgentEngine, approval *tools.ApprovalManager) tuiModel {
+func New(workDir string, modelName string, agent *engine.AgentEngine) tuiModel {
 
 	ta := textarea.New()
 	ta.Placeholder = "输入任务, 按 Enter 发送, Alt+Enter / Ctrl+J 换行..."
@@ -143,7 +140,6 @@ func New(workDir string, modelName string, agent *engine.AgentEngine, approval *
 		textarea:          ta,
 		viewport:          vp,
 		status:            status,
-		approval:          approval,
 		thinkingLineStart: -1,
 		actionLineStart:   -1,
 	}
