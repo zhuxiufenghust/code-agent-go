@@ -31,8 +31,14 @@ func TestMain(m *testing.M) {
 
 // fakeProvider 是一个脚本化的 LLMProvider，按调用顺序回放预设响应。
 // 既支持 Run 使用的 Generate，也支持 StreamRun 使用的 GenerateStream。
+// 内嵌 UsageTracker 复用用量统计，并自行累计用量，
+// 使测试替身在"用量统计"这一点上与真实 Provider 行为一致。
 type fakeProvider struct {
+	provider.UsageTracker
+
 	mu sync.Mutex
+
+	usage schema.Usage
 
 	genScript    []genStep
 	genIdx       int
@@ -78,7 +84,24 @@ func (p *fakeProvider) Generate(ctx context.Context, history []schema.Message, a
 	if step.usage == nil {
 		step.usage = &schema.Usage{}
 	}
+	p.accumulateUsage(step.usage)
 	return step.msg, step.usage, nil
+}
+
+// accumulateUsage 累计本次调用的用量，供 GetUsage 返回（mu 已由调用方持有）。
+func (p *fakeProvider) accumulateUsage(u *schema.Usage) {
+	if u == nil {
+		return
+	}
+	p.usage.InputTokens += u.InputTokens
+	p.usage.OutputTokens += u.OutputTokens
+}
+
+// GetUsage 返回测试替身累计的用量，语义与真实 Provider 一致（跨多次调用求和）。
+func (p *fakeProvider) GetUsage() schema.Usage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.usage
 }
 
 func (p *fakeProvider) GenerateStream(ctx context.Context, history []schema.Message, availableTools []schema.ToolDefinition) (<-chan schema.StreamChunk, error) {
@@ -99,6 +122,7 @@ func (p *fakeProvider) GenerateStream(ctx context.Context, history []schema.Mess
 	if usage == nil {
 		usage = &schema.Usage{}
 	}
+	p.accumulateUsage(usage)
 
 	go func() {
 		defer close(ch)
@@ -603,6 +627,7 @@ func TestStreamRun_Error(t *testing.T) {
 
 // errorStreamProvider 仅在 GenerateStream 第一帧返回 error chunk。
 type errorStreamProvider struct {
+	provider.UsageTracker
 	err error
 }
 

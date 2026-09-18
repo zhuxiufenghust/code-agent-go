@@ -33,27 +33,57 @@ type LLMProvider interface {
 	// 返回的 channel 会在流结束时自动关闭。调用方必须从 channel 读取直到关闭，
 	// 以确保底层 HTTP 连接被正确释放。
 	GenerateStream(ctx context.Context, messages []schema.Message, availableTools []schema.ToolDefinition) (<-chan schema.StreamChunk, error)
+
+	GetUsage() schema.Usage
 }
 
-// 通过BaseProvider实现LLMProvider接口的默认方法，Generate调用GenerateStream并收集结果
-// 具体的GenerateStream方法需要在具体的Provider中实现
-type BaseProvider struct {
-	// 这里可以放一些通用的字段，比如配置、日志等
+// UsageTracker 是可被各 Provider 内嵌的"用量统计"状态复用，
+// 只负责累计用量并对外提供 GetUsage。
+//
+// 这里刻意不放任何需要派发的行为：Go 的嵌入没有虚派发，
+// 写在被嵌入类型上的 Generate 只会调用到它自己的 GenerateStream，
+// 结果不是多态而是必错的空壳。Generate / GenerateStream 请各 Provider 自行实现，
+// 其中 Generate 用 GenerateFromStream 一行转调即可。
+type UsageTracker struct {
+	usage schema.Usage
 }
 
-func (p *BaseProvider) Generate(ctx context.Context, messages []schema.Message, availableTools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
-	ch, err := p.GenerateStream(ctx, messages, availableTools)
+// StreamFunc 是 GenerateStream 的函数签名，用于把"建流"能力作为参数传给 GenerateFromStream。
+type StreamFunc func(ctx context.Context, messages []schema.Message, availableTools []schema.ToolDefinition) (<-chan schema.StreamChunk, error)
+
+// GenerateFromStream 是非流式 Generate 的统一实现：建流 → 收集最终结果。
+//
+// 各 Provider 只需在自己的 Generate 里一行转调本函数，即可保证所有 Provider 的
+// 非流式语义完全一致（不必复制粘贴收集逻辑）：
+//
+//	func (p *XxxProvider) Generate(ctx context.Context, msgs []schema.Message,
+//		tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
+//		return GenerateFromStream(ctx, p.GenerateStream, msgs, tools)
+//	}
+//
+// 之所以做成"包级函数 + 传入方法值"，而不是放在被嵌入的类型上当默认实现：
+// Go 的嵌入没有虚派发，被嵌入类型上的 Generate 只会调用到它自己的 GenerateStream；
+// 而 p.GenerateStream 作为方法值传进来时已经绑定了正确的接收者，派发一定指向具体实现。
+func GenerateFromStream(ctx context.Context, streamFn StreamFunc,
+	messages []schema.Message, availableTools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
+	if streamFn == nil {
+		return nil, nil, errors.New("GenerateFromStream: streamFn 为 nil")
+	}
+	ch, err := streamFn(ctx, messages, availableTools)
 	if err != nil {
 		return nil, nil, err
 	}
-	var finalMessage *schema.Message
-	var usage *schema.Usage
+	return CollectStream(ch)
+}
+
+// CollectStream 从流式 channel 收集最终结果：
+// 读到 done chunk 返回其 Message/Usage，读到 error chunk 返回错误，
+// channel 提前关闭则返回 "stream closed without final message"。
+func CollectStream(ch <-chan schema.StreamChunk) (*schema.Message, *schema.Usage, error) {
 	for chunk := range ch {
 		switch chunk.Type {
 		case schema.StreamChunkDone:
-			finalMessage = chunk.Message
-			usage = chunk.Usage
-			return finalMessage, usage, nil
+			return chunk.Message, chunk.Usage, nil
 		case schema.StreamChunkError:
 			return nil, nil, chunk.Err
 		}
@@ -61,8 +91,17 @@ func (p *BaseProvider) Generate(ctx context.Context, messages []schema.Message, 
 	return nil, nil, errors.New("stream closed without final message")
 }
 
-func (p *BaseProvider) GenerateStream(ctx context.Context, messages []schema.Message, availableTools []schema.ToolDefinition) (<-chan schema.StreamChunk, error) {
-	panic("not implemented")
+// AccumulateUsage 累计一次调用的用量，供 GetUsage 汇总统计。
+func (p *UsageTracker) AccumulateUsage(u *schema.Usage) {
+	if u == nil {
+		return
+	}
+	p.usage.InputTokens += u.InputTokens
+	p.usage.OutputTokens += u.OutputTokens
+}
+
+func (p *UsageTracker) GetUsage() schema.Usage {
+	return p.usage
 }
 
 func sendStreamChunk(ctx context.Context, ch chan<- schema.StreamChunk, chunk schema.StreamChunk) bool {
