@@ -82,7 +82,10 @@ type tuiModel struct {
 
 	textarea textarea.Model // 输入框
 
-	status LineText // workDir + model + token ratio + status
+	status LineText // 状态栏：token 用量 + 模型 + 工作目录（见 statusText）
+	// usage 是引擎上报的累计 token 用量，作为状态栏的单一数据源：
+	// 事件只更新这里，展示文本统一由 statusText() 拼装，避免多处各拼一份而不一致。
+	usage schema.Usage
 
 	// 审批弹窗队列：并发工具调用会几乎同时发来多个 EventApprovalRequired，
 	// 而 TUI 同一时刻只能展示一个对话框，因此用 FIFO 队列暂存待审批请求，
@@ -131,18 +134,26 @@ func New(workDir string, modelName string, agent *engine.AgentEngine) tuiModel {
 
 	vp := viewport.New(80, 20)
 
-	status := NewLineText("工作目录: " + workDir + " | 模型: " + modelName + " ")
-
-	return tuiModel{
+	m := tuiModel{
 		workDir:           workDir,
 		modelName:         modelName,
 		agent:             agent,
 		textarea:          ta,
 		viewport:          vp,
-		status:            status,
 		thinkingLineStart: -1,
 		actionLineStart:   -1,
 	}
+	// 状态栏文本统一由 statusText() 生成，构造与后续更新走同一份逻辑。
+	m.status = NewLineText(m.statusText())
+	return m
+}
+
+// statusText 拼装状态栏文本。
+// 把 token 用量放在最前：LineText 会按窗口宽度截断尾部（见 truncateToWidth），
+// 工作目录通常最长，放末尾可以保证用量在窄终端下依然可见。
+func (m tuiModel) statusText() string {
+	return fmt.Sprintf("Token: in=%d out=%d | 模型: %s | 工作目录: %s",
+		m.usage.InputTokens, m.usage.OutputTokens, m.modelName, m.workDir)
 }
 
 func (m tuiModel) Init() tea.Cmd {
@@ -472,6 +483,27 @@ func (m tuiModel) handleEvent(evt engine.Event) (tea.Model, tea.Cmd) {
 		m = m.renderViewportLines()
 		m.textarea.Focus()
 		return m, nil
+	case engine.EventUsage:
+		// 只更新状态栏：
+		// 1) 不要 finalizePendingAction()——用量事件与正文流式无关，
+		//    在这里结束正文块会把正在流式的回答切成两段；
+		// 2) 不要在这里单独 return——必须 fall through 到函数末尾的公共收尾，
+		//    否则事件循环就此中断：后续事件无人消费、引擎阻塞在 sendEvent，
+		//    EventDone 永不到达，输入框也就再也拿不回焦点（表现为"输入不了"）。
+		switch u := evt.Data.(type) {
+		// 只接受 *schema.Usage：引擎侧（reportUsage）固定发送指针快照，
+		// 值类型是契约外的数据，走 default 打日志即可——多一个分支反而会
+		// 悄悄放过"上下游约定被改坏"的情况。
+		case *schema.Usage:
+			if u == nil {
+				log.Warn("usage 事件数据为 nil")
+			} else {
+				m.usage = *u
+			}
+		default:
+			log.Warn("usage 事件数据类型异常", zap.Any("data", evt.Data))
+		}
+		m.status = m.status.WithText(m.statusText())
 	}
 
 	// 除终止事件外，每个事件处理完都要继续读取下一个，否则事件循环会在

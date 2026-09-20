@@ -31,6 +31,8 @@ const (
 	// EventFinal 表示 runLoop 主动收尾（达到最大轮次 / 判定重复调用卡住）。
 	// Data 类型为 string（给用户的最终文本说明）。
 	EventFinal EventType = "final"
+
+	EventUsage EventType = "usage"
 )
 
 // defaultRunTimeout 是单轮流式运行的总时长上限。
@@ -93,8 +95,8 @@ func (e *AgentEngine) StreamRun(ctx context.Context, userPrompt string) (<-chan 
 		Final: func(text string) {
 			sendEvent(ctx, ch, Event{Type: EventFinal, Data: text})
 		},
-		TokenUpdate: func(tokens, window int) {
-			panic("not imp")
+		TokenUpdate: func(ctx context.Context, turn int, usage *schema.Usage) {
+			sendEvent(ctx, ch, Event{Type: EventUsage, Turn: 0, Data: usage})
 		},
 	}
 

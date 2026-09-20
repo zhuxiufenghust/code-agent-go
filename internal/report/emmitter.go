@@ -15,7 +15,7 @@ type Emitter struct {
 	// tokenUpdate 报告当前 context 的 token 用量。
 	// 在 LLM 调用前以估算值调用；调用后若有实际用量则以实际值再次调用。
 	// tokens = token 数；window = 模型 context window（0 表示未知）。
-	TokenUpdate func(tokens, window int)
+	TokenUpdate func(ctx context.Context, turn int, usage *schema.Usage)
 
 	// compaction 在上下文发生有效压缩时调用（token 数减少 > 5%）。
 	// compaction func(data CompactionData)

@@ -35,6 +35,9 @@ type AgentEngine struct {
 	generateRetryBase  time.Duration // 重试退避基准（默认 1s）
 	workDir            string
 	homeDir            string
+	// usage 是本会话（本 AgentEngine）累计的 token 用量，
+	// 由 generateWithRetry 在每次 LLM 调用成功后累计，与 Provider 级用量解耦。
+	usage schema.Usage
 
 	// 可选，指定 session ID；若为空则使用默认 session, 记忆是基于sessionID的
 	sessionID string
@@ -166,6 +169,31 @@ func (e *AgentEngine) SaveHistoryContext(ctx context.Context, msgs []schema.Mess
 	}
 }
 
+// addUsage 累计会话级用量。
+// 刻意不复用 provider.GetUsage()：那是 Provider 级累计，
+// 一旦多 Provider 路由或复用同一 provider 跑多个会话就会串账；
+// 用量应当挂在会话（AgentEngine）上。
+func (e *AgentEngine) addUsage(u *schema.Usage) {
+	if u == nil {
+		return
+	}
+	e.usage.InputTokens += u.InputTokens
+	e.usage.OutputTokens += u.OutputTokens
+}
+
+// reportUsage 把当前累计用量推给客户端（TUI 展示 / 无头记录）。
+// 未设置回调（如非流式模式）时直接跳过，不产生任何副作用。
+func (e *AgentEngine) reportUsage(ctx context.Context, turn int) {
+	if e.emitter.TokenUpdate == nil {
+		return
+	}
+	snapshot := e.usage // 传快照，避免调用方持有并修改内部状态
+	e.emitter.TokenUpdate(ctx, turn, &snapshot)
+}
+
+// Usage 返回本会话累计用量快照（供外部展示/测试断言）。
+func (e *AgentEngine) Usage() schema.Usage { return e.usage }
+
 func (e *AgentEngine) generateWithRetry(ctx context.Context, turn int, history []schema.Message, toolDefs []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 	var rspMsg *schema.Message
 	var usage *schema.Usage
@@ -185,6 +213,12 @@ func (e *AgentEngine) generateWithRetry(ctx context.Context, turn int, history [
 	for i := 0; i < maxRetries; i++ {
 		rspMsg, usage, err = e.emitter.Generate(ctx, turn, history, toolDefs)
 		if err == nil {
+			// 唯一的用量采集点：所有 LLM 调用（流式/非流式、含重试）都经过本函数，
+			// 因此用量逻辑只在这里出现一次，runLoop 不必再关心"从哪取、何时报"。
+			// 工具执行本身不消耗 token，故不在 executeTools 后重复上报
+			// （工具输出会作为下一轮的 input，体现在下一次 LLM 调用的用量里）。
+			e.addUsage(usage)
+			e.reportUsage(ctx, turn)
 			return rspMsg, usage, nil
 		}
 		if i < maxRetries-1 {
@@ -298,6 +332,8 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			log.Error("llm_call_failed", zap.Int("turn", turnCount), zap.Error(err))
 			return err
 		}
+		// 用量采集与上报已收敛到 generateWithRetry（成功分支），这里不再重复处理：
+		// 主循环只管业务，观测逻辑不侵入。
 		// Emitter 约定：err 为 nil 时 Message 不应为 nil。这里兜住实现违规（或 mock），
 		// 否则下面的 *rspMsg 会空指针让整轮运行直接崩溃。
 		if rspMsg == nil {
@@ -335,7 +371,10 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			break
 		}
 
+		// 工具执行不消耗 token，因此这里不上报用量：
+		// 工具输出会作为下一轮的 input，体现在下一次 LLM 调用的用量里。
 		results := e.executeTools(ctx, turnCount, rspMsg.ToolCalls, logPrefix)
+
 		for _, res := range results {
 			finalOutput := res.Output
 			if res.IsError {
@@ -384,8 +423,14 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 			log.Info("tool call done", zap.String("tool_call_id", tc.ID), zap.String("tool_name", tc.Name), zap.Duration("duration", d),
 				zap.String("output", result.Output), zap.Bool("is_error", result.IsError))
 		},
-		TokenUpdate: func(tokens, window int) {
-			panic("not imp")
+		// 阻塞模式没有事件流可以把用量推给客户端：只记日志，
+		// panic 会让非流式调用一跑就崩（无头/CI 场景必踩）。
+		TokenUpdate: func(ctx context.Context, turn int, usage *schema.Usage) {
+			if usage == nil {
+				return
+			}
+			log.Debug("token_usage", zap.Int("turn", turn),
+				zap.Int("input_tokens", usage.InputTokens), zap.Int("output_tokens", usage.OutputTokens))
 		},
 		// 阻塞模式没有事件流可以把审批请求送给人：ApprovalRequired 保持 nil，
 		// ApproveManager 会据此“默认放行”（向后兼容）。若在这里放一个必然返回 false
