@@ -6,6 +6,14 @@ import (
 	"strings"
 )
 
+// 救援规则按工具名匹配，工具名与 registry 中注册的名称保持一致。
+const (
+	ToolNameEdit  = "edit_tool"
+	ToolNameRead  = "read_tool"
+	ToolNameWrite = "write_tool"
+	ToolNameBash  = "bash_tool"
+)
+
 type RecoveryManager struct {
 	// Add fields for RecoveryManager if needed
 }
@@ -15,16 +23,16 @@ func NewRecoveryManager() *RecoveryManager {
 	return &RecoveryManager{}
 }
 
-// AnalyzeAndInject is a placeholder method for analyzing and injecting context.
-// Implement the actual recovery logic as needed.
-func (rm *RecoveryManager) AnalyzeAndInject(ctx context.Context, toolName string, rawErr string) string {
+// AnalyzeAndInject 根据工具名与原始报错注入针对性修复指南。
+// ctx 目前未参与规则匹配，保留在签名中以便后续接入动态策略（如按会话状态调整话术）。
+func (rm *RecoveryManager) AnalyzeAndInject(_ context.Context, toolName string, rawErr string) string {
 	// Placeholder implementation
 	var hint string
 	// 我们使用相对稳定的英文系统级报错关键字，或者我们自己手写的工具内部固定报错格式
 	lowerError := strings.ToLower(rawErr)
 	// 匹配我们在 07 讲中手写的 fuzzyReplace 的固定报错抛出
 	switch toolName {
-	case "edit_tool":
+	case ToolNameEdit:
 		if strings.Contains(lowerError, "在文件中未找到 old_text") || strings.Contains(lowerError, "找不到该代码片段") {
 			hint = "你提供的 old_text 与文件当前内容不一致，或者缺少必要的缩进。请先使用 `read_file` 工具重新读取该文件，获取最新、准确的内容后，再重新发起编辑。"
 		} else if strings.Contains(lowerError, "匹配到了") || strings.Contains(lowerError, "上下文代码") || strings.Contains(lowerError, "上下行代码") {
@@ -32,13 +40,13 @@ func (rm *RecoveryManager) AnalyzeAndInject(ctx context.Context, toolName string
 		} else if strings.Contains(lowerError, "文件不存在") || strings.Contains(lowerError, "no such file or directory") {
 			hint = "目标文件不存在。请不要凭空猜测路径，先使用 `bash` 执行 `ls -la` 或 `find . -name` 确认文件位置后再编辑。"
 		}
-	case "read_tool", "write_tool":
+	case ToolNameRead, ToolNameWrite:
 		if strings.Contains(lowerError, "no such file or directory") || strings.Contains(lowerError, "文件不存在") {
 			hint = "路径似乎不正确。请不要凭空猜测，先使用 `bash` 执行 `ls -la` 或 `find . -name` 命令查找正确的目录结构和文件名。"
 		} else if strings.Contains(lowerError, "permission denied") {
 			hint = "你没有权限操作该文件。请检查工作区限制，或者思考是否需要修改其他文件。"
 		}
-	case "bash_tool":
+	case ToolNameBash:
 		if strings.Contains(lowerError, "command not found") {
 			hint = "系统中未安装该命令。请先思考：是否有替代命令？或者你需要先编写脚本进行安装？"
 		} else if strings.Contains(lowerError, "超时") || strings.Contains(lowerError, "deadline exceeded") { // 匹配 context.WithTimeout 的真实报错 "context deadline exceeded"
