@@ -10,6 +10,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
+	"github.com/zhuxiufenghust/code-agent-go/internal/context_mng"
 	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
 	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
@@ -94,7 +95,10 @@ func main() {
 	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
 		engine.WithHomeDir(homeDir),
 		engine.WithSessionID(sessID), engine.WithMaxLoopTurns(cfg.Engine.MaxLoopTurns),
+		// 压缩配置由 ApplyDefaults 补齐，这里无条件装配（缺配置不再等于关闭压缩）。
+		engine.WithCompactor(buildCompactor(cfg, pr)),
 	)
+
 	if approvalMgr != nil {
 		approvalMgr.SetEmitGetter(agent)
 	}
@@ -150,6 +154,24 @@ func normalizeConfig() *config.Config {
 	// 补齐生产默认值（如循环轮次上限），避免配置缺项时保护被静默关闭。
 	cfg.ApplyDefaults()
 	return cfg
+}
+
+// buildCompactor 按配置装配压缩器。
+// 关键点：token 窗口与消息条数是两种不同单位，不能混用——
+// sliding 策略吃的是"消息条数"，token/summarization 吃的是"token 窗口"。
+func buildCompactor(cfg *config.Config, pr *provider.OpenAIProvider) context_mng.Compactor {
+	c := cfg.Compactor
+	switch c.Strategy {
+	case config.CompactorStrategySliding:
+		return context_mng.NewSlidingWindowCompactor(c.MaxMessages)
+	case config.CompactorStrategyToken:
+		return context_mng.NewTokenBudgetCompactor(c.ContextWindow)
+	default:
+		// summarization：LLM 摘要为主，令牌预算兜底（摘要失败/摘要后仍超预算时使用）。
+		// fallback 必须与主策略同单位，否则兜底阈值永不触发、降级链路形同虚设。
+		return context_mng.NewSummarizationCompactor(pr, c.ContextWindow, c.MinTail,
+			context_mng.NewTokenBudgetCompactor(c.ContextWindow))
+	}
 }
 
 func parseFlags(homeDir string, workDir string) {

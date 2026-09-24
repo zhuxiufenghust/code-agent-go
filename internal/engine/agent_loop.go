@@ -48,6 +48,7 @@ type AgentEngine struct {
 	maxLoopTurns int            // 可选，限制单次 runLoop 最大轮次，0 表示无限制
 	emitter      report.Emitter // 可选，事件回调接口
 
+	compactor context_mng.Compactor // 可选，消息压缩器
 }
 
 func WithToolTimeout(timeout time.Duration) Option {
@@ -64,6 +65,14 @@ func WithMaxLoopTurns(max int) Option {
 func WithMaxConcurrentTools(max int) Option {
 	return func(e *AgentEngine) {
 		e.maxConcurrentTools = max
+	}
+}
+
+// WithCompactor 注入上下文压缩器。每轮 LLM 调用前压缩 llmContext，
+// 超预算时按策略裁剪/摘要历史，避免长任务把上下文窗口打爆。
+func WithCompactor(compactor context_mng.Compactor) Option {
+	return func(e *AgentEngine) {
+		e.compactor = compactor
 	}
 }
 
@@ -324,6 +333,19 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 
 		llmStartTime := time.Now()
 
+		if e.compactor != nil {
+			msgsBefore := len(llmContext)
+			tokensBefore := context_mng.EstimateTokens(llmContext)
+			compacted, err := e.compactor.Compact(ctx, llmContext)
+			if err != nil {
+				// 压缩失败不能中断主流程：沿用未压缩的上下文继续跑，
+				// 由 provider 侧的错误（超窗 400）暴露真实问题。
+				log.Error("compactor_failed_use_origin_context", zap.Int("turn", turnCount), zap.Error(err))
+			} else if len(compacted) != msgsBefore {
+				llmContext, startIndex = e.applyCompaction(ctx, compacted, startIndex, turnCount, msgsBefore, tokensBefore)
+			}
+		}
+
 		rspMsg, usage, err := e.generateWithRetry(ctx, turnCount, llmContext, tools)
 		llmEndTime := time.Now()
 		llmElapsed := llmEndTime.Sub(llmStartTime)
@@ -408,6 +430,46 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 	e.SaveHistoryContext(ctx, llmContext, startIndex)
 
 	return nil
+}
+
+// applyCompaction 把压缩结果写回 live 上下文，并同步会话持久化边界。
+//
+// 压缩会删除历史消息并可能插入摘要/占位消息，因此会话里已持久化的历史
+// 不再与 live 上下文一一对应。若继续按原 startIndex 增量追加，会出现两种故障：
+//  1. len(compacted) <= startIndex：SaveHistoryContext 直接 return，本轮新消息全部丢失；
+//  2. 只删了一部分头：msgs[startIndex:] 取到错位片段，漏存 dropped 条。
+//
+// 因此压缩生效时清空会话消息并把 startIndex 归零，让本轮结束时的
+// SaveHistoryContext 把整份（已压缩的）上下文重新落库，会话始终镜像 live 上下文。
+func (e *AgentEngine) applyCompaction(ctx context.Context, compacted []schema.Message, startIndex, turn,
+	msgsBefore, tokensBefore int) ([]schema.Message, int) {
+	tokensAfter := context_mng.EstimateTokens(compacted)
+
+	if e.session != nil {
+		if err := e.session.Clear(ctx); err != nil {
+			// 清空失败时不能把 startIndex 归零，否则旧历史与压缩后的上下文会混成重复消息；
+			// 退化为"只落库压缩后新增的消息"，宁可丢本轮增量也不制造重复历史。
+			log.Error("compaction_clear_session_failed", zap.String("session_id", e.sessionID), zap.Error(err))
+			startIndex = len(compacted)
+		} else {
+			startIndex = 0
+		}
+	}
+
+	log.Info("context_compacted", zap.Int("turn", turn),
+		zap.Int("msgs_before", msgsBefore), zap.Int("msgs_after", len(compacted)),
+		zap.Int("tokens_before", tokensBefore), zap.Int("tokens_after", tokensAfter),
+		zap.String("session_id", e.sessionID))
+	if e.emitter.Compaction != nil {
+		e.emitter.Compaction(report.CompactionData{
+			Turn:         turn,
+			MsgsBefore:   msgsBefore,
+			MsgsAfter:    len(compacted),
+			TokensBefore: tokensBefore,
+			TokensAfter:  tokensAfter,
+		})
+	}
+	return compacted, startIndex
 }
 
 func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {

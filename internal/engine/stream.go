@@ -33,6 +33,10 @@ const (
 	EventFinal EventType = "final"
 
 	EventUsage EventType = "usage"
+
+	// EventCompaction 表示上下文被压缩（历史被裁剪/替换为摘要）。
+	// Data 类型为 report.CompactionData。
+	EventCompaction EventType = "compaction"
 )
 
 // defaultRunTimeout 是单轮流式运行的总时长上限。
@@ -97,6 +101,11 @@ func (e *AgentEngine) StreamRun(ctx context.Context, userPrompt string) (<-chan 
 		},
 		TokenUpdate: func(ctx context.Context, turn int, usage *schema.Usage) {
 			sendEvent(ctx, ch, Event{Type: EventUsage, Turn: 0, Data: usage})
+		},
+		// 压缩对用户可见：TUI 需要知道"模型看到的上下文已经不是屏幕上这份了"。
+		// 事件送达失败（流关闭/取消）时无副作用，压缩结果仍在 live 上下文中生效。
+		Compaction: func(data report.CompactionData) {
+			sendEvent(ctx, ch, Event{Type: EventCompaction, Turn: data.Turn, Data: data})
 		},
 	}
 

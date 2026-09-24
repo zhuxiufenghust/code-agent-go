@@ -17,8 +17,9 @@ type Emitter struct {
 	// tokens = token 数；window = 模型 context window（0 表示未知）。
 	TokenUpdate func(ctx context.Context, turn int, usage *schema.Usage)
 
-	// compaction 在上下文发生有效压缩时调用（token 数减少 > 5%）。
-	// compaction func(data CompactionData)
+	// Compaction 在上下文发生有效压缩时调用（消息条数真的变少了）。
+	// 未压缩（预算内直接返回）时不调用，避免每轮噪声。为 nil 表示无人关心。
+	Compaction func(data CompactionData)
 
 	// approval 是人类审批回调，注入到工具执行 context 中。
 	// RunStream 模式下通过 EventApprovalRequired 事件驱动 TUI 审批对话框；
@@ -37,4 +38,14 @@ type Emitter struct {
 	// final 在 runLoop 主动收尾时（达到最大轮次 / 判定卡住）输出最终文本，
 	// 使流式客户端也能看到"为什么停了"，而不是无声结束。为 nil 表示无人关心。
 	Final func(text string)
+}
+
+// CompactionData 描述一次有效的上下文压缩，供客户端（TUI 状态栏/日志）展示。
+// token 数为引擎侧估算值（context_mng.EstimateTokens），非 provider 实际用量。
+type CompactionData struct {
+	Turn         int
+	MsgsBefore   int
+	MsgsAfter    int
+	TokensBefore int
+	TokensAfter  int
 }

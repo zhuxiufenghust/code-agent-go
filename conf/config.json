@@ -17,10 +17,19 @@
     "engine": {
         "maxConcurrentTools": 10
     },
+    "compactor": {
+        "strategy": "summarization",
+        "contextWindow": 200000,
+        "minTail": 6
+    },
     "tool": {
         "enableApproval": true,
         "dangerCmds": ["ls -la", "rm -rf *", "ls"]
     },
     "skill": {
+    },
+    "compactor": {
+        "contextWindow": 200000000,
+        "minTail":6
     }
 }
