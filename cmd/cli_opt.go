@@ -8,7 +8,8 @@ type cliOptions struct {
 	resumeID    string
 	showVersion bool
 
-	homeDir string
-	workDir string
-	appName string
+	homeDir   string
+	workDir   string
+	appName   string
+	sessionID string
 }

@@ -158,6 +158,15 @@ func (e *AgentEngine) LoadHistoryContext(ctx context.Context, userInput string) 
 			Content: systemPrompt,
 		}
 		return []schema.Message{systemPromptMsg, userMsg}, 0
+	} else if len(msgs) > 0 {
+		systemPrompt := e.buildSystemPrompt()
+		systemPromptMsg := schema.Message{
+			Role:    schema.SystemRole,
+			Content: systemPrompt,
+		}
+		if msgs[0].Role != schema.SystemRole {
+			msgs = append([]schema.Message{systemPromptMsg}, msgs...)
+		}
 	}
 	startIndex := len(msgs)
 	msgs = append(msgs, schema.Message{
@@ -167,15 +176,22 @@ func (e *AgentEngine) LoadHistoryContext(ctx context.Context, userInput string) 
 	return msgs, startIndex
 }
 
-// SaveHistoryContext 将当前轮次的消息追加到历史上下文中, 只保存新消息
-func (e *AgentEngine) SaveHistoryContext(ctx context.Context, msgs []schema.Message, startIndex int) {
+// SaveHistoryContext 将当前轮次的消息追加到历史上下文中，只保存新消息。
+//
+// 返回推进后的持久化边界（llmContext 中下一条尚未落库消息的下标）：
+// 调用方必须把它写回自己的 startIndex，否则后续调用会重复写入同一批消息。
+// 写入失败时边界保持不变，进度仍留在内存里，可安全重试下一次保存。
+func (e *AgentEngine) SaveHistoryContext(ctx context.Context, msgs []schema.Message, startIndex int) int {
 	if e.session == nil || len(msgs) == 0 || startIndex >= len(msgs) {
-		return
+		return startIndex
 	}
-	err := e.session.AddMessages(ctx, msgs[startIndex:])
-	if err != nil {
-		log.Error("failed to save history context", zap.Error(err), zap.String("session_id", e.sessionID))
+	pending := msgs[startIndex:]
+	if err := e.session.AddMessages(ctx, pending); err != nil {
+		log.Error("failed to save history context", zap.Error(err), zap.String("session_id", e.sessionID),
+			zap.Int("pending", len(pending)))
+		return startIndex
 	}
+	return startIndex + len(pending)
 }
 
 // addUsage 累计会话级用量。
@@ -296,13 +312,29 @@ func toolCallsSignature(calls []schema.ToolCall) string {
 	return b.String()
 }
 
-func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string) error {
+// saveTimeout 是收尾落库的独立超时。
+// runLoop 返回时 processCtx 往往已经超时或被取消（用户中断、到达运行上限），
+// 若沿用同一个 ctx 写库会立即失败，本轮进度会整体丢失。
+const saveTimeout = 3 * time.Second
 
-	// TODO: 增加session加载历史消息
+func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string) error {
+	// 落盘 ctx 必须脱离调用方 ctx 的取消链路，保证 defer 收尾时仍可写入。
+	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), saveTimeout)
+	defer cancelSave()
 
 	var turnCount int
 	tools := e.registry.GetAvailableTools()
 	llmContext, startIndex := e.LoadHistoryContext(ctx, userPrompt)
+
+	// persist 把 llmContext 中尚未落库的部分追加写入会话并推进边界，可重复调用。
+	persist := func() {
+		startIndex = e.SaveHistoryContext(saveCtx, llmContext, startIndex)
+	}
+
+	// 统一收尾：正常收敛、达到轮次上限、判定卡住、LLM 报错、空响应、
+	// ctx 取消或超时，都必须走到这里。否则异常路径会把整轮
+	// （含不可再生的工具执行结果）丢掉，下一次恢复时模型无从得知自己做过什么。
+	defer persist()
 
 	// finalize 是统一收尾：把终止原因作为"最终文本回复"写入上下文与会话，
 	// 并通过 emitter.Final 通知客户端（TUI 能看到"为什么停了"），而不是无声结束。
@@ -363,6 +395,9 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			return errors.New("llm 返回空响应")
 		}
 		llmContext = append(llmContext, *rspMsg)
+		// assistant 消息一产生就落库：它是不可再生的已付费产物，
+		// 攒到轮末再写的话，中途中止会把这条（连同其工具调用）一起丢掉。
+		persist()
 		// usage 允许为 nil（Emitter 约定：无实际用量时返回 nil），不能无条件解引用。
 		var inTokens, outTokens int
 		if usage != nil {
@@ -426,9 +461,10 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 				IsError: res.IsError,
 			})
 		}
+		// 本圈的工具结果全部回灌后落库：至此交互记录已经稳定，
+		// 提前写入能把"丢失窗口"从一整轮压缩到一次 LLM 调用。
+		persist()
 	}
-	e.SaveHistoryContext(ctx, llmContext, startIndex)
-
 	return nil
 }
 

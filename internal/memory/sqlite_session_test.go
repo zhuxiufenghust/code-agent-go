@@ -2,8 +2,12 @@ package memory
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -117,6 +121,140 @@ func TestSQLiteSession_ToolCallsRoundTrip(t *testing.T) {
 	if msgs[0].ToolCallID != "call_1" {
 		t.Errorf("ToolCallID 往返失败: %q", msgs[0].ToolCallID)
 	}
+}
+
+func TestSQLiteSession_IsErrorRoundTrip(t *testing.T) {
+	sess := newTestSQLiteSession(t)
+	in := []schema.Message{
+		{Role: schema.UserRole, Content: "q1"},
+		{Role: schema.AssistantRole, Content: "calling", ToolCalls: []schema.ToolCall{
+			{ID: "call_1", Name: "read", Arguments: []byte(`{"path":"x"}`)},
+		}},
+		{Role: schema.UserRole, Content: "工具执行超时", ToolCallID: "call_1", IsError: true},
+		{Role: schema.UserRole, Content: "工具执行成功", ToolCallID: "call_1", IsError: false},
+	}
+	if err := sess.AddMessages(context.Background(), in); err != nil {
+		t.Fatalf("AddMessages 返回错误: %v", err)
+	}
+	msgs, err := sess.GetMessages(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("GetMessages 返回错误: %v", err)
+	}
+	if len(msgs) != len(in) {
+		t.Fatalf("期望 %d 条消息, 实际 %d 条", len(in), len(msgs))
+	}
+	want := []bool{false, false, true, false}
+	for i, w := range want {
+		if msgs[i].IsError != w {
+			t.Errorf("第 %d 条 IsError 往返失败: 期望 %v, 实际 %v (%q)",
+				i, w, msgs[i].IsError, msgs[i].Content)
+		}
+	}
+}
+
+func TestSQLiteSession_PopMessage_PreservesIsError(t *testing.T) {
+	sess := newTestSQLiteSession(t)
+	if err := sess.AddMessages(context.Background(), []schema.Message{
+		{Role: schema.UserRole, Content: "工具执行超时", ToolCallID: "call_1", IsError: true},
+	}); err != nil {
+		t.Fatalf("AddMessages 返回错误: %v", err)
+	}
+	msg, err := sess.PopMessage(context.Background())
+	if err != nil {
+		t.Fatalf("PopMessage 返回错误: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("PopMessage 返回 nil")
+	}
+	if !msg.IsError {
+		t.Errorf("PopMessage 丢失 IsError: %+v", msg)
+	}
+	if msg.ToolCallID != "call_1" {
+		t.Errorf("PopMessage 丢失 ToolCallID: %q", msg.ToolCallID)
+	}
+}
+
+// TestSQLiteSession_MigratesLegacySchema 覆盖旧库升级：
+// schemaSQL 是 CREATE TABLE IF NOT EXISTS，不会给已存在的 messages 表补列，
+// 若缺少迁移，老会话库里的 IsError 会在写入时被静默丢弃。
+func TestSQLiteSession_MigratesLegacySchema(t *testing.T) {
+	home := t.TempDir()
+	if err := createLegacyDB(t, home); err != nil {
+		t.Fatalf("构造旧库失败: %v", err)
+	}
+
+	sess, err := NewSQLiteSession("legacy-sess", home)
+	if err != nil {
+		t.Fatalf("打开旧库失败: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sess.db.Close(); err != nil {
+			t.Errorf("关闭数据库失败: %v", err)
+		}
+	})
+
+	// 老数据（迁移前写入、无 is_error 列）读回后 IsError 应为 false 且不报错。
+	old, err := sess.GetMessages(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("迁移后 GetMessages 返回错误: %v", err)
+	}
+	if len(old) != 1 || old[0].Content != "legacy" {
+		t.Fatalf("迁移后应保留原有 1 条消息, 实际 %+v", old)
+	}
+	if old[0].IsError {
+		t.Errorf("旧数据缺少 is_error，期望读取为 false, 实际 true")
+	}
+
+	// 迁移后的库必须能写入并读回 IsError。
+	if err := sess.AddMessages(context.Background(), []schema.Message{
+		{Role: schema.UserRole, Content: "工具执行超时", ToolCallID: "call_1", IsError: true},
+	}); err != nil {
+		t.Fatalf("迁移后 AddMessages 返回错误: %v", err)
+	}
+	msgs, err := sess.GetMessages(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("迁移后 GetMessages 返回错误: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("期望 2 条消息, 实际 %d 条", len(msgs))
+	}
+	if !msgs[1].IsError {
+		t.Errorf("迁移后 IsError 写入失败: %+v", msgs[1])
+	}
+}
+
+// createLegacyDB 手工建出一个不含 is_error 列的历史版本数据库。
+func createLegacyDB(t *testing.T, home string) error {
+	t.Helper()
+	path := filepath.Join(home, dbPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("创建数据库目录: %w", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("打开数据库: %w", err)
+	}
+	defer db.Close()
+
+	legacySQL := `CREATE TABLE IF NOT EXISTS messages (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT    NOT NULL,
+    role         TEXT    NOT NULL,
+    content      TEXT    NOT NULL,
+    tool_calls   TEXT,
+    tool_call_id TEXT,
+    created_at   INTEGER NOT NULL
+);`
+	if _, err := db.Exec(legacySQL); err != nil {
+		return fmt.Errorf("建旧表失败: %w", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)`,
+		"legacy-sess", string(schema.UserRole), "legacy", time.Now().Unix(),
+	); err != nil {
+		return fmt.Errorf("写入旧数据失败: %w", err)
+	}
+	return nil
 }
 
 func TestSQLiteSession_PopMessage(t *testing.T) {

@@ -89,8 +89,12 @@ func main() {
 	} else {
 		log.Warn("工具审批已被显式关闭：高危命令将直接执行")
 	}
-
-	sessID := uuid.New().String()
+	var sessID string
+	if cliOp.sessionID != "" {
+		sessID = cliOp.sessionID
+	} else {
+		sessID = uuid.New().String()
+	}
 
 	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
 		engine.WithHomeDir(homeDir),
@@ -183,6 +187,7 @@ func parseFlags(homeDir string, workDir string) {
 	flag.StringVarP(&configPath, "config", "c", "config.json", "Path to the configuration file")
 	flag.BoolVarP(&enableTools, "enable-tools", "e", false, "Enable tools")
 	flag.StringVarP(&resumeID, "resume-id", "r", "", "Resume ID")
+	flag.StringVarP(&cliOp.sessionID, "session-id", "s", "", "Session ID")
 	flag.BoolVarP(&showVersion, "version", "v", false, "Show version information")
 	flag.Parse()
 
@@ -190,7 +195,7 @@ func parseFlags(homeDir string, workDir string) {
 		cliOp.configPath = &configPath
 	}
 	cliOp.enableTools = enableTools
-	cliOp.resumeID = resumeID
+	cliOp.sessionID = resumeID
 	cliOp.showVersion = showVersion
 }
 
