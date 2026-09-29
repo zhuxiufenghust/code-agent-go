@@ -182,11 +182,10 @@ func parseFlags(homeDir string, workDir string) {
 	cliOp.homeDir = homeDir
 	cliOp.workDir = workDir
 
-	var configPath, resumeID string
+	var configPath string
 	var enableTools, showVersion bool
 	flag.StringVarP(&configPath, "config", "c", "config.json", "Path to the configuration file")
 	flag.BoolVarP(&enableTools, "enable-tools", "e", false, "Enable tools")
-	flag.StringVarP(&resumeID, "resume-id", "r", "", "Resume ID")
 	flag.StringVarP(&cliOp.sessionID, "session-id", "s", "", "Session ID")
 	flag.BoolVarP(&showVersion, "version", "v", false, "Show version information")
 	flag.Parse()
@@ -195,7 +194,6 @@ func parseFlags(homeDir string, workDir string) {
 		cliOp.configPath = &configPath
 	}
 	cliOp.enableTools = enableTools
-	cliOp.sessionID = resumeID
 	cliOp.showVersion = showVersion
 }
 
