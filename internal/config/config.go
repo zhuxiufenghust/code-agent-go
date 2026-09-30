@@ -33,14 +33,43 @@ type OpenAIConfig struct {
 
 // Config is the configuration for the application.
 type Config struct {
-	Log    *LogConfig    `json:"log"`    // 日志相关配置
-	OpenAI *OpenAIConfig `json:"openai"` // OpenAI 相关配置
-	Engine *EngineConfig `json:"engine"` // AgentEngine 相关配置
-	LTM    *LtmConfig    `json:"ltm"`    // LTM 相关配置
-	Memory *MemoryConfig `json:"memory"` // Memory 相关配置
-	Skill  *SkillConfig  `json:"skill"`  // Skill 相关配置
-	Tool   *ToolConfig   `json:"tool"`   // Tool 相关配置
+	Log       *LogConfig       `json:"log"`       // 日志相关配置
+	OpenAI    *OpenAIConfig    `json:"openai"`    // OpenAI 相关配置
+	Engine    *EngineConfig    `json:"engine"`    // AgentEngine 相关配置
+	LTM       *LtmConfig       `json:"ltm"`       // LTM 相关配置
+	Memory    *MemoryConfig    `json:"memory"`    // Memory 相关配置
+	Skill     *SkillConfig     `json:"skill"`     // Skill 相关配置
+	Tool      *ToolConfig      `json:"tool"`      // Tool 相关配置
+	Compactor *CompactorConfig `json:"compactor"` // Compactor 相关配置
 }
+
+// CompactorConfig 是上下文压缩相关配置。
+type CompactorConfig struct {
+	// Strategy 压缩策略：summarization（默认，LLM 摘要 + 令牌预算兜底）、
+	// token（仅按令牌预算丢弃最旧消息）、sliding（仅保留最近 MaxMessages 条）。
+	Strategy string `json:"strategy" yaml:"strategy"`
+	// ContextWindow 模型上下文窗口（token）。压缩预算取其 80%。
+	ContextWindow int `json:"contextWindow" yaml:"contextWindow"`
+	// MinTail 压缩时至少保留的最近消息条数（summarization/token 策略）。
+	MinTail int `json:"minTail" yaml:"minTail"`
+	// MaxMessages 保留的最大消息条数，仅 sliding 策略使用。
+	MaxMessages int `json:"maxMessages" yaml:"maxMessages"`
+}
+
+// 压缩策略枚举值。
+const (
+	CompactorStrategySummarization = "summarization"
+	CompactorStrategyToken         = "token"
+	CompactorStrategySliding       = "sliding"
+)
+
+const (
+	// DefaultContextWindow 是未配置 compactor.contextWindow 时使用的模型窗口（token）。
+	DefaultContextWindow = 200_000
+	// DefaultMinTail 是未配置 compactor.minTail 时保留的最近消息条数。
+	DefaultMinTail = 6
+)
+
 type EngineConfig struct {
 	WorkDir            string        `json:"workDir" yaml:"workDir"`
 	MaxHistoryMsgs     int           `json:"maxHistoryMsgs" yaml:"maxHistoryMsgs"`
@@ -73,6 +102,19 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Engine.MaxLoopTurns <= 0 {
 		c.Engine.MaxLoopTurns = DefaultMaxLoopTurns
+	}
+	// compactor 段缺失不应等价于"关闭压缩"：补默认配置，与各压缩器内部回落保持一致。
+	if c.Compactor == nil {
+		c.Compactor = &CompactorConfig{}
+	}
+	if c.Compactor.Strategy == "" {
+		c.Compactor.Strategy = CompactorStrategySummarization
+	}
+	if c.Compactor.ContextWindow <= 0 {
+		c.Compactor.ContextWindow = DefaultContextWindow
+	}
+	if c.Compactor.MinTail <= 0 {
+		c.Compactor.MinTail = DefaultMinTail
 	}
 }
 

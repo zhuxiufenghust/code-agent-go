@@ -35,6 +35,9 @@ type AgentEngine struct {
 	generateRetryBase  time.Duration // 重试退避基准（默认 1s）
 	workDir            string
 	homeDir            string
+	// usage 是本会话（本 AgentEngine）累计的 token 用量，
+	// 由 generateWithRetry 在每次 LLM 调用成功后累计，与 Provider 级用量解耦。
+	usage schema.Usage
 
 	// 可选，指定 session ID；若为空则使用默认 session, 记忆是基于sessionID的
 	sessionID string
@@ -45,6 +48,7 @@ type AgentEngine struct {
 	maxLoopTurns int            // 可选，限制单次 runLoop 最大轮次，0 表示无限制
 	emitter      report.Emitter // 可选，事件回调接口
 
+	compactor context_mng.Compactor // 可选，消息压缩器
 }
 
 func WithToolTimeout(timeout time.Duration) Option {
@@ -61,6 +65,14 @@ func WithMaxLoopTurns(max int) Option {
 func WithMaxConcurrentTools(max int) Option {
 	return func(e *AgentEngine) {
 		e.maxConcurrentTools = max
+	}
+}
+
+// WithCompactor 注入上下文压缩器。每轮 LLM 调用前压缩 llmContext，
+// 超预算时按策略裁剪/摘要历史，避免长任务把上下文窗口打爆。
+func WithCompactor(compactor context_mng.Compactor) Option {
+	return func(e *AgentEngine) {
+		e.compactor = compactor
 	}
 }
 
@@ -146,6 +158,15 @@ func (e *AgentEngine) LoadHistoryContext(ctx context.Context, userInput string) 
 			Content: systemPrompt,
 		}
 		return []schema.Message{systemPromptMsg, userMsg}, 0
+	} else if len(msgs) > 0 {
+		systemPrompt := e.buildSystemPrompt()
+		systemPromptMsg := schema.Message{
+			Role:    schema.SystemRole,
+			Content: systemPrompt,
+		}
+		if msgs[0].Role != schema.SystemRole {
+			msgs = append([]schema.Message{systemPromptMsg}, msgs...)
+		}
 	}
 	startIndex := len(msgs)
 	msgs = append(msgs, schema.Message{
@@ -155,16 +176,48 @@ func (e *AgentEngine) LoadHistoryContext(ctx context.Context, userInput string) 
 	return msgs, startIndex
 }
 
-// SaveHistoryContext 将当前轮次的消息追加到历史上下文中, 只保存新消息
-func (e *AgentEngine) SaveHistoryContext(ctx context.Context, msgs []schema.Message, startIndex int) {
+// SaveHistoryContext 将当前轮次的消息追加到历史上下文中，只保存新消息。
+//
+// 返回推进后的持久化边界（llmContext 中下一条尚未落库消息的下标）：
+// 调用方必须把它写回自己的 startIndex，否则后续调用会重复写入同一批消息。
+// 写入失败时边界保持不变，进度仍留在内存里，可安全重试下一次保存。
+func (e *AgentEngine) SaveHistoryContext(ctx context.Context, msgs []schema.Message, startIndex int) int {
 	if e.session == nil || len(msgs) == 0 || startIndex >= len(msgs) {
+		return startIndex
+	}
+	pending := msgs[startIndex:]
+	if err := e.session.AddMessages(ctx, pending); err != nil {
+		log.Error("failed to save history context", zap.Error(err), zap.String("session_id", e.sessionID),
+			zap.Int("pending", len(pending)))
+		return startIndex
+	}
+	return startIndex + len(pending)
+}
+
+// addUsage 累计会话级用量。
+// 刻意不复用 provider.GetUsage()：那是 Provider 级累计，
+// 一旦多 Provider 路由或复用同一 provider 跑多个会话就会串账；
+// 用量应当挂在会话（AgentEngine）上。
+func (e *AgentEngine) addUsage(u *schema.Usage) {
+	if u == nil {
 		return
 	}
-	err := e.session.AddMessages(ctx, msgs[startIndex:])
-	if err != nil {
-		log.Error("failed to save history context", zap.Error(err), zap.String("session_id", e.sessionID))
-	}
+	e.usage.InputTokens += u.InputTokens
+	e.usage.OutputTokens += u.OutputTokens
 }
+
+// reportUsage 把当前累计用量推给客户端（TUI 展示 / 无头记录）。
+// 未设置回调（如非流式模式）时直接跳过，不产生任何副作用。
+func (e *AgentEngine) reportUsage(ctx context.Context, turn int) {
+	if e.emitter.TokenUpdate == nil {
+		return
+	}
+	snapshot := e.usage // 传快照，避免调用方持有并修改内部状态
+	e.emitter.TokenUpdate(ctx, turn, &snapshot)
+}
+
+// Usage 返回本会话累计用量快照（供外部展示/测试断言）。
+func (e *AgentEngine) Usage() schema.Usage { return e.usage }
 
 func (e *AgentEngine) generateWithRetry(ctx context.Context, turn int, history []schema.Message, toolDefs []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 	var rspMsg *schema.Message
@@ -185,6 +238,12 @@ func (e *AgentEngine) generateWithRetry(ctx context.Context, turn int, history [
 	for i := 0; i < maxRetries; i++ {
 		rspMsg, usage, err = e.emitter.Generate(ctx, turn, history, toolDefs)
 		if err == nil {
+			// 唯一的用量采集点：所有 LLM 调用（流式/非流式、含重试）都经过本函数，
+			// 因此用量逻辑只在这里出现一次，runLoop 不必再关心"从哪取、何时报"。
+			// 工具执行本身不消耗 token，故不在 executeTools 后重复上报
+			// （工具输出会作为下一轮的 input，体现在下一次 LLM 调用的用量里）。
+			e.addUsage(usage)
+			e.reportUsage(ctx, turn)
 			return rspMsg, usage, nil
 		}
 		if i < maxRetries-1 {
@@ -253,13 +312,29 @@ func toolCallsSignature(calls []schema.ToolCall) string {
 	return b.String()
 }
 
-func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string) error {
+// saveTimeout 是收尾落库的独立超时。
+// runLoop 返回时 processCtx 往往已经超时或被取消（用户中断、到达运行上限），
+// 若沿用同一个 ctx 写库会立即失败，本轮进度会整体丢失。
+const saveTimeout = 3 * time.Second
 
-	// TODO: 增加session加载历史消息
+func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string) error {
+	// 落盘 ctx 必须脱离调用方 ctx 的取消链路，保证 defer 收尾时仍可写入。
+	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), saveTimeout)
+	defer cancelSave()
 
 	var turnCount int
 	tools := e.registry.GetAvailableTools()
 	llmContext, startIndex := e.LoadHistoryContext(ctx, userPrompt)
+
+	// persist 把 llmContext 中尚未落库的部分追加写入会话并推进边界，可重复调用。
+	persist := func() {
+		startIndex = e.SaveHistoryContext(saveCtx, llmContext, startIndex)
+	}
+
+	// 统一收尾：正常收敛、达到轮次上限、判定卡住、LLM 报错、空响应、
+	// ctx 取消或超时，都必须走到这里。否则异常路径会把整轮
+	// （含不可再生的工具执行结果）丢掉，下一次恢复时模型无从得知自己做过什么。
+	defer persist()
 
 	// finalize 是统一收尾：把终止原因作为"最终文本回复"写入上下文与会话，
 	// 并通过 emitter.Final 通知客户端（TUI 能看到"为什么停了"），而不是无声结束。
@@ -290,6 +365,19 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 
 		llmStartTime := time.Now()
 
+		if e.compactor != nil {
+			msgsBefore := len(llmContext)
+			tokensBefore := context_mng.EstimateTokens(llmContext)
+			compacted, err := e.compactor.Compact(ctx, llmContext)
+			if err != nil {
+				// 压缩失败不能中断主流程：沿用未压缩的上下文继续跑，
+				// 由 provider 侧的错误（超窗 400）暴露真实问题。
+				log.Error("compactor_failed_use_origin_context", zap.Int("turn", turnCount), zap.Error(err))
+			} else if len(compacted) != msgsBefore {
+				llmContext, startIndex = e.applyCompaction(ctx, compacted, startIndex, turnCount, msgsBefore, tokensBefore)
+			}
+		}
+
 		rspMsg, usage, err := e.generateWithRetry(ctx, turnCount, llmContext, tools)
 		llmEndTime := time.Now()
 		llmElapsed := llmEndTime.Sub(llmStartTime)
@@ -298,6 +386,8 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			log.Error("llm_call_failed", zap.Int("turn", turnCount), zap.Error(err))
 			return err
 		}
+		// 用量采集与上报已收敛到 generateWithRetry（成功分支），这里不再重复处理：
+		// 主循环只管业务，观测逻辑不侵入。
 		// Emitter 约定：err 为 nil 时 Message 不应为 nil。这里兜住实现违规（或 mock），
 		// 否则下面的 *rspMsg 会空指针让整轮运行直接崩溃。
 		if rspMsg == nil {
@@ -305,6 +395,9 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			return errors.New("llm 返回空响应")
 		}
 		llmContext = append(llmContext, *rspMsg)
+		// assistant 消息一产生就落库：它是不可再生的已付费产物，
+		// 攒到轮末再写的话，中途中止会把这条（连同其工具调用）一起丢掉。
+		persist()
 		// usage 允许为 nil（Emitter 约定：无实际用量时返回 nil），不能无条件解引用。
 		var inTokens, outTokens int
 		if usage != nil {
@@ -335,7 +428,10 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 			break
 		}
 
+		// 工具执行不消耗 token，因此这里不上报用量：
+		// 工具输出会作为下一轮的 input，体现在下一次 LLM 调用的用量里。
 		results := e.executeTools(ctx, turnCount, rspMsg.ToolCalls, logPrefix)
+
 		for _, res := range results {
 			finalOutput := res.Output
 			if res.IsError {
@@ -365,10 +461,51 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 				IsError: res.IsError,
 			})
 		}
+		// 本圈的工具结果全部回灌后落库：至此交互记录已经稳定，
+		// 提前写入能把"丢失窗口"从一整轮压缩到一次 LLM 调用。
+		persist()
 	}
-	e.SaveHistoryContext(ctx, llmContext, startIndex)
-
 	return nil
+}
+
+// applyCompaction 把压缩结果写回 live 上下文，并同步会话持久化边界。
+//
+// 压缩会删除历史消息并可能插入摘要/占位消息，因此会话里已持久化的历史
+// 不再与 live 上下文一一对应。若继续按原 startIndex 增量追加，会出现两种故障：
+//  1. len(compacted) <= startIndex：SaveHistoryContext 直接 return，本轮新消息全部丢失；
+//  2. 只删了一部分头：msgs[startIndex:] 取到错位片段，漏存 dropped 条。
+//
+// 因此压缩生效时清空会话消息并把 startIndex 归零，让本轮结束时的
+// SaveHistoryContext 把整份（已压缩的）上下文重新落库，会话始终镜像 live 上下文。
+func (e *AgentEngine) applyCompaction(ctx context.Context, compacted []schema.Message, startIndex, turn,
+	msgsBefore, tokensBefore int) ([]schema.Message, int) {
+	tokensAfter := context_mng.EstimateTokens(compacted)
+
+	if e.session != nil {
+		if err := e.session.Clear(ctx); err != nil {
+			// 清空失败时不能把 startIndex 归零，否则旧历史与压缩后的上下文会混成重复消息；
+			// 退化为"只落库压缩后新增的消息"，宁可丢本轮增量也不制造重复历史。
+			log.Error("compaction_clear_session_failed", zap.String("session_id", e.sessionID), zap.Error(err))
+			startIndex = len(compacted)
+		} else {
+			startIndex = 0
+		}
+	}
+
+	log.Info("context_compacted", zap.Int("turn", turn),
+		zap.Int("msgs_before", msgsBefore), zap.Int("msgs_after", len(compacted)),
+		zap.Int("tokens_before", tokensBefore), zap.Int("tokens_after", tokensAfter),
+		zap.String("session_id", e.sessionID))
+	if e.emitter.Compaction != nil {
+		e.emitter.Compaction(report.CompactionData{
+			Turn:         turn,
+			MsgsBefore:   msgsBefore,
+			MsgsAfter:    len(compacted),
+			TokensBefore: tokensBefore,
+			TokensAfter:  tokensAfter,
+		})
+	}
+	return compacted, startIndex
 }
 
 func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
@@ -384,8 +521,14 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 			log.Info("tool call done", zap.String("tool_call_id", tc.ID), zap.String("tool_name", tc.Name), zap.Duration("duration", d),
 				zap.String("output", result.Output), zap.Bool("is_error", result.IsError))
 		},
-		TokenUpdate: func(tokens, window int) {
-			panic("not imp")
+		// 阻塞模式没有事件流可以把用量推给客户端：只记日志，
+		// panic 会让非流式调用一跑就崩（无头/CI 场景必踩）。
+		TokenUpdate: func(ctx context.Context, turn int, usage *schema.Usage) {
+			if usage == nil {
+				return
+			}
+			log.Debug("token_usage", zap.Int("turn", turn),
+				zap.Int("input_tokens", usage.InputTokens), zap.Int("output_tokens", usage.OutputTokens))
 		},
 		// 阻塞模式没有事件流可以把审批请求送给人：ApprovalRequired 保持 nil，
 		// ApproveManager 会据此“默认放行”（向后兼容）。若在这里放一个必然返回 false

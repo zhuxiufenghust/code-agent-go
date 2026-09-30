@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content      TEXT    NOT NULL,
     tool_calls   TEXT,
     tool_call_id TEXT,
+    is_error     INTEGER NOT NULL DEFAULT 0,
     created_at   INTEGER NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -49,6 +50,60 @@ CREATE TABLE IF NOT EXISTS session_todos (
 
 CREATE INDEX IF NOT EXISTS idx_todos_session ON session_todos(session_id);
 `
+
+// messagesExtraColumns 记录 messages 表后来新增的列。
+// schemaSQL 用的是 CREATE TABLE IF NOT EXISTS：对已存在的旧库不会补字段，
+// 缺列的库会把工具失败信号（IsError）在写入时静默丢弃，因此必须显式迁移。
+var messagesExtraColumns = map[string]string{
+	"is_error": "is_error INTEGER NOT NULL DEFAULT 0",
+}
+
+// ensureMessagesColumns 补齐历史库缺失的 messages 列，幂等。
+func ensureMessagesColumns(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(messages)")
+	if err != nil {
+		return fmt.Errorf("读取 messages 表结构: %w", err)
+	}
+	defer rows.Close()
+
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+			return fmt.Errorf("解析 messages 表结构: %w", err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("迭代 messages 表结构: %w", err)
+	}
+
+	for name, ddl := range messagesExtraColumns {
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN " + ddl); err != nil {
+			return fmt.Errorf("新增 messages 列 %s: %w", name, err)
+		}
+		log.Info("已为历史会话库补齐 messages 列", zap.String("column", name))
+	}
+	return nil
+}
+
+// boolToInt 将布尔标记转成 SQLite 的 0/1 存储。
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 func NewSQLiteSession(sessID string, homeDir string) (*SQLiteSession, error) {
 	sess := &SQLiteSession{
@@ -94,6 +149,10 @@ func (s *SQLiteSession) init() error {
 		db.Close()
 		return fmt.Errorf("初始化 schema: %w", err)
 	}
+	if err := ensureMessagesColumns(db); err != nil {
+		db.Close()
+		return err
+	}
 	now := time.Now().Unix()
 	if _, err := db.Exec(
 		`INSERT OR IGNORE INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)`,
@@ -107,7 +166,7 @@ func (s *SQLiteSession) init() error {
 }
 
 func (s *SQLiteSession) GetMessages(ctx context.Context, limit int) ([]schema.Message, error) {
-	rows, err := s.db.Query("SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+	rows, err := s.db.Query("SELECT role, content, tool_calls, tool_call_id, is_error FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
 		s.sessionID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询消息: %w", err)
@@ -119,8 +178,9 @@ func (s *SQLiteSession) GetMessages(ctx context.Context, limit int) ([]schema.Me
 			content     string
 			toolCallsJS sql.NullString
 			toolCallID  sql.NullString
+			isError     sql.NullInt64
 		)
-		if err := rows.Scan(&roleStr, &content, &toolCallsJS, &toolCallID); err != nil {
+		if err := rows.Scan(&roleStr, &content, &toolCallsJS, &toolCallID, &isError); err != nil {
 			return nil, fmt.Errorf("扫描消息: %w", err)
 		}
 		msg := schema.Message{
@@ -134,6 +194,9 @@ func (s *SQLiteSession) GetMessages(ctx context.Context, limit int) ([]schema.Me
 		}
 		if toolCallID.Valid {
 			msg.ToolCallID = toolCallID.String
+		}
+		if isError.Valid && isError.Int64 != 0 {
+			msg.IsError = true
 		}
 		msgs = append(msgs, msg)
 	}
@@ -176,8 +239,8 @@ func (s *SQLiteSession) AddMessages(ctx context.Context, msgs []schema.Message) 
 		}
 
 		if _, err := tx.Exec(
-			"INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-			s.sessionID, msg.Role, msg.Content, toolCallsJS, msg.ToolCallID, now,
+			"INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, is_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			s.sessionID, msg.Role, msg.Content, toolCallsJS, msg.ToolCallID, boolToInt(msg.IsError), now,
 		); err != nil {
 			dbErr = fmt.Errorf("插入消息: %w", err)
 			return dbErr
@@ -198,15 +261,16 @@ func (s *SQLiteSession) AddMessages(ctx context.Context, msgs []schema.Message) 
 	return nil
 }
 func (s *SQLiteSession) PopMessage(ctx context.Context) (*schema.Message, error) {
-	row := s.db.QueryRow("SELECT id, role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", s.sessionID)
+	row := s.db.QueryRow("SELECT id, role, content, tool_calls, tool_call_id, is_error FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", s.sessionID)
 	var (
 		roleStr     string
 		content     string
 		toolCallsJS sql.NullString
 		toolCallID  sql.NullString
+		isError     sql.NullInt64
 	)
 	var id int64
-	err := row.Scan(&id, &roleStr, &content, &toolCallsJS, &toolCallID)
+	err := row.Scan(&id, &roleStr, &content, &toolCallsJS, &toolCallID, &isError)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -224,6 +288,9 @@ func (s *SQLiteSession) PopMessage(ctx context.Context) (*schema.Message, error)
 	}
 	if toolCallID.Valid {
 		msg.ToolCallID = toolCallID.String
+	}
+	if isError.Valid && isError.Int64 != 0 {
+		msg.IsError = true
 	}
 	// 删除消息失败，只简单记录日志
 	res, err := s.db.Exec("DELETE FROM messages WHERE id = ?", id)

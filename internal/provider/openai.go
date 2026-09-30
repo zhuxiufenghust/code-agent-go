@@ -22,7 +22,7 @@ import (
 // 2. GenerateStream: 以流式方式发送对话上下文，逐步接收模型的增量输出。
 // 相关的apiKey、baseURL等配置不应该直接传递，而应该通过env获取
 type OpenAIProvider struct {
-	BaseProvider
+	UsageTracker
 	config *config.OpenAIConfig
 
 	client openai.Client
@@ -55,6 +55,13 @@ func NewOpenAIProvider(cfg *config.OpenAIConfig) *OpenAIProvider {
 	return provider
 }
 
+// Generate 非流式调用：转调统一的 GenerateFromStream（收集逻辑与所有 Provider 一致）。
+// 传入的 p.GenerateStream 是方法值，已绑定本对象，因此一定走 OpenAIProvider 的实现。
+// 用量已在 GenerateStream 内累计，这里不要重复累计。
+func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
+	return GenerateFromStream(ctx, p.GenerateStream, msgs, availableTools)
+}
+
 func (p *OpenAIProvider) GenerateStream(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition) (<-chan schema.StreamChunk, error) {
 	ch := make(chan schema.StreamChunk)
 	openaiMsgs := p.convertMessages(msgs)
@@ -78,6 +85,9 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, msgs []schema.Messa
 		var contentBuf strings.Builder
 		toolAccs := newToolCallAccumulators()
 		var actualUsage *schema.Usage
+		defer func() {
+			p.AccumulateUsage(actualUsage)
+		}()
 
 		for stream.Next() {
 			chunk := stream.Current()

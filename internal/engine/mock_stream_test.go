@@ -5,11 +5,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
 )
 
-type mockProvider struct{}
+// mockProvider 内嵌 UsageTracker 复用用量统计，
+// 与真实 Provider 的构造方式保持一致（新增接口方法时不必逐个改测试替身）。
+type mockProvider struct {
+	provider.UsageTracker
+}
 
 func (m *mockProvider) Generate(_ context.Context, _ []schema.Message, _ []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 	return nil, nil, nil

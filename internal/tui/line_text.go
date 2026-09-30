@@ -26,6 +26,13 @@ func (c LineText) WithStyle(s lipgloss.Style) LineText {
 	return c
 }
 
+// WithText 直接替换文本：用于状态栏这类"数据变了就地重绘"的场景，
+// 不必绕一圈 SetTextMsg（少一次事件往返，也就少一处漏掉事件循环收尾的风险）。
+func (c LineText) WithText(text string) LineText {
+	c.text = text
+	return c
+}
+
 func (c LineText) WithWidth(w int) LineText {
 	c.width = w
 	return c
