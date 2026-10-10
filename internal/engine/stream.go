@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/base"
+	"github.com/zhuxiufenghust/code-agent-go/internal/config"
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"github.com/zhuxiufenghust/code-agent-go/internal/report"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
@@ -39,10 +40,16 @@ const (
 	EventCompaction EventType = "compaction"
 )
 
-// defaultRunTimeout 是单轮流式运行的总时长上限。
-// 注意：等待人工审批的时间不计入（见 pausableTimeoutCtx），
-// 因此这里可以保持较短，用来兜住“模型/工具卡死”而不是“人慢”。
-const defaultRunTimeout = time.Minute
+// runTimeout 返回整轮流式运行的总时长上限。
+// 未通过 WithRunTimeout 显式指定（或指定为非正值）时回落到 config.DefaultRunTimeout，
+// 保证默认值只有一处定义。
+// 注意：等待人工审批的时间不计入（见 pausableTimeoutCtx）。
+func (e *AgentEngine) runTimeoutOrDefault() time.Duration {
+	if e.runTimeout > 0 {
+		return e.runTimeout
+	}
+	return config.DefaultRunTimeout
+}
 
 // ToolResultData 是 EventToolResult 事件的载荷，携带工具执行结果和引擎侧精确耗时。
 type ToolResultData struct {
@@ -64,11 +71,19 @@ type Event struct {
 	Data any `json:"data,omitempty"`
 }
 
+// errorEventSendTimeout 是错误事件（EventError）的兜底投递超时。
+// EventError 是运行失败后发给客户端的最后一条消息：TUI 正常时会立刻读走；
+// 但若客户端事件循环已停读（审批弹窗模态、异常中断），无缓冲 channel 的
+// 裸发送会永久阻塞，defer close(ch) 无法执行——TUI 的 readNextEvent
+// 永远等不到 channel 关闭，表现为"假死"（输入框拿不回焦点）。
+// 超时后放弃发送并关闭 channel，TUI 侧读到关闭的 channel 会转为 EventDone。
+var errorEventSendTimeout = 5 * time.Second
+
 func (e *AgentEngine) StreamRun(ctx context.Context, userPrompt string) (<-chan Event, error) {
 	ch := make(chan Event)
 	// 整轮运行的总时长上限。人工审批等待由 pauser 暂停计时，不计入该配额。
 	// 必须在 emitter 之前创建：emitter 的审批回调需要它来暂停/恢复计时。
-	processCtx, pauser, cancelProcess := newPausableTimeout(ctx, defaultRunTimeout)
+	processCtx, pauser, cancelProcess := newPausableTimeout(ctx, e.runTimeoutOrDefault())
 	em := report.Emitter{
 		Generate: func(ctx context.Context, turn int, history []schema.Message, tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 			return e.streamGenerate(ctx, ch, turn, history, tools)
@@ -116,7 +131,17 @@ func (e *AgentEngine) StreamRun(ctx context.Context, userPrompt string) (<-chan 
 		defer cancelProcess()
 
 		if err := e.runLoop(processCtx, userPrompt, "agent-stream"); err != nil {
-			ch <- Event{Type: EventError, Data: err.Error()}
+			// 不能裸发送：ch 无缓冲，客户端停读（审批弹窗模态/异常中断）时
+			// 会永久阻塞，defer close(ch) 无法执行，TUI 表现为假死。
+			// processCtx 此刻往往已超时/取消，因此用脱离其取消链路、
+			// 带兜底超时的 ctx 发送；超时放弃后关闭 channel，
+			// TUI 的 readNextEvent 读到关闭的 channel 会转为 EventDone。
+			deliverCtx, cancelDeliver := context.WithTimeout(
+				context.WithoutCancel(processCtx), errorEventSendTimeout)
+			defer cancelDeliver()
+			if !sendEvent(deliverCtx, ch, Event{Type: EventError, Data: err.Error()}) {
+				log.Warn("error_event_not_delivered", zap.String("user_prompt", userPrompt), zap.Error(err))
+			}
 			return
 		}
 

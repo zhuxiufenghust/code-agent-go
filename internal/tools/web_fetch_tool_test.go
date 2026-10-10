@@ -274,7 +274,7 @@ func TestWebFetchTool_BlocksPrivateIP(t *testing.T) {
 func TestWebFetchTool_BlocksRedirectToPrivate(t *testing.T) {
 	// 初始 host(127.0.0.1) 解析为公网，重定向终点 internal.example 解析为内网
 	stubResolverForHost(t, map[string][]string{
-		"127.0.0.1":       {"203.0.113.1"},
+		"127.0.0.1":        {"203.0.113.1"},
 		"internal.example": {"192.168.0.9"},
 	})
 	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

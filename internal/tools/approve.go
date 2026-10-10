@@ -88,7 +88,7 @@ func (h *ApprovalManager) approvalTimeout() time.Duration {
 
 // IsDangerousCommand 判断该工具调用是否需要人工审批：
 // 内置高危规则（hooks.MatchDangerous，开箱即有底线）+ 配置黑名单（dangerCmds）。
-// 对 bash 只匹配真正的命令字符串，避免把 JSON 键名/路径等无关片段算进匹配范围。
+// 对 bash 只匹配从参数 JSON 中提取出的命令字符串，避免把 JSON 键名/路径等无关片段算进匹配范围。
 func (h *ApprovalManager) IsDangerousCommand(toolName string, args string) bool {
 	// 对于纯读取的工具，默认 YOLO 模式，全部放行
 	if toolName != "bash_tool" && toolName != "edit_tool" && toolName != "write_tool" {
@@ -97,16 +97,30 @@ func (h *ApprovalManager) IsDangerousCommand(toolName string, args string) bool 
 
 	// 针对 bash 的高危模式匹配
 	if toolName == "bash_tool" {
-		if ok, _ := hooks.MatchDangerous(BashCommand(args)); ok {
+		command := BashCommand(args)
+		if ok, _ := hooks.MatchDangerous(command); ok {
 			return true
 		}
 		for _, p := range h.dangerPatterns() {
-			if matched, _ := regexp.MatchString(p, args); matched {
+			if matchDangerPattern(p, command) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// matchDangerPattern 判断配置黑名单项是否命中命令。
+// 黑名单按正则理解（如 "kubectl\s+delete"），但整体加 \b 词边界锚定：
+// 不加边界时 "ls" 会命中 "tools"、"lsblk" 等任何含该子串的文本，
+// 导致审批弹窗远比配置预期频繁。
+func matchDangerPattern(pattern, command string) bool {
+	re, err := regexp.Compile(`\b(?:` + pattern + `)\b`)
+	if err != nil {
+		// 非法正则按不命中处理：黑名单写错不应拦住所有命令。
+		return false
+	}
+	return re.MatchString(command)
 }
 
 // BashCommand 从 bash_tool 的参数 JSON 中取出待执行的命令；

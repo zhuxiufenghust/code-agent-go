@@ -76,6 +76,10 @@ type EngineConfig struct {
 	MaxLoopTurns       int           `json:"maxLoopTurns" yaml:"maxLoopTurns"`
 	ToolTimeout        time.Duration `json:"toolTimeout" yaml:"toolTimeout"`
 	MaxConcurrentTools int           `json:"maxConcurrentTools" yaml:"maxConcurrentTools"`
+	// RunTimeout 是单轮流式运行的总时长上限（等待人工审批的时间不计入）。
+	// 缺省或 <=0 时由 ApplyDefaults 补上 DefaultRunTimeout。
+	// JSON/YAML 走数值（纳秒），如需可读写法可在外部转成纳秒。
+	RunTimeout time.Duration `json:"runTimeout" yaml:"runTimeout"`
 }
 
 type LtmConfig struct {
@@ -92,6 +96,11 @@ const (
 	// DefaultMaxLoopTurns 是单轮 agent 循环的默认上限：
 	// 生产上必须有兜底，否则模型死循环会无限烧钱。配置为 0/缺省时取该值。
 	DefaultMaxLoopTurns = 30
+	// DefaultRunTimeout 是单轮流式运行（StreamRun）的默认总时长上限。
+	// 1 分钟对 CR/重构这类要跑十几轮工具的任务明显不够——模型往往在
+	// 最后一轮（正要输出报告时）被掐断，且已付费的上下文因为没走到收尾而浪费。
+	// 这里放宽到 10 分钟，仅作兜住"模型/工具卡死"的最后防线。
+	DefaultRunTimeout = 10 * time.Minute
 )
 
 // ApplyDefaults 为未配置的项补上生产可用的默认值，避免"配置缺一段"就等于"保护关闭"。
@@ -102,6 +111,11 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Engine.MaxLoopTurns <= 0 {
 		c.Engine.MaxLoopTurns = DefaultMaxLoopTurns
+	}
+	// runTimeout 缺省不应等价于"没有上限"：
+	// 0/负数会退化成立即到期（newPausableTimeout 拿到非正时长等于一启动就超时），必须补默认值。
+	if c.Engine.RunTimeout <= 0 {
+		c.Engine.RunTimeout = DefaultRunTimeout
 	}
 	// compactor 段缺失不应等价于"关闭压缩"：补默认配置，与各压缩器内部回落保持一致。
 	if c.Compactor == nil {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
 	"github.com/zhuxiufenghust/code-agent-go/internal/memory"
@@ -58,6 +59,55 @@ func TestRunLoop_PersistsOnLLMError(t *testing.T) {
 	msgs := readSessionMessages(t, homeDir, sessID)
 	// 至少用户的提问要留下来，否则下一次恢复时连自己问了什么都不知道。
 	hasContent(t, msgs, "persist-me")
+}
+
+// sleepyProvider 在首次 Generate 前阻塞一段时间，把后续所有 persist 推到
+// 落库超时窗口之外，用于覆盖"运行时间超过 saveTimeout"的场景。
+type sleepyProvider struct {
+	*fakeProvider
+
+	once  sync.Once
+	delay time.Duration
+}
+
+func (p *sleepyProvider) Generate(ctx context.Context, history []schema.Message, toolDefs []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
+	p.once.Do(func() { time.Sleep(p.delay) })
+	return p.fakeProvider.Generate(ctx, history, toolDefs)
+}
+
+// TestRunLoop_PersistsBeyondSaveTimeoutWindow 是"saveCtx 只建一次"的回归用例。
+//
+// 原实现在 runLoop 入口创建唯一的 3s saveCtx，而 persist 在整个循环里被反复调用，
+// 于是配额在头几秒耗尽后，之后每一次写入都必定 deadline exceeded——上一次 CR
+// 跑到第 10 轮仍是一条都没存下来（日志里 pending 累积到 25）。
+// 这里让运行时间超过该窗口，断言收尾时的消息依然完整落库。
+func TestRunLoop_PersistsBeyondSaveTimeoutWindow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("该用例需真实等待超过落库超时窗口，-short 下跳过")
+	}
+	homeDir, sessID := t.TempDir(), t.Name()
+	p := &sleepyProvider{
+		fakeProvider: &fakeProvider{genScript: []genStep{
+			{msg: &schema.Message{Role: schema.AssistantRole, Content: "reply-one"}, usage: &schema.Usage{}},
+			{msg: &schema.Message{Role: schema.AssistantRole, Content: "reply-two"}, usage: &schema.Usage{}},
+		}},
+		delay: 3200 * time.Millisecond,
+	}
+	e := engine.NewAgentEngine(p, &fakeRegistry{},
+		engine.WithHomeDir(homeDir), engine.WithSessionID(sessID))
+
+	if err := e.Run(context.Background(), "beyond-save-timeout"); err != nil {
+		t.Fatalf("Run 返回错误: %v", err)
+	}
+
+	// 无 tool_call 的 assistant 消息会立刻收敛，故本轮只消耗一个 genStep：
+	// system + user + assistant 共 3 条。
+	msgs := readSessionMessages(t, homeDir, sessID)
+	if len(msgs) != 3 {
+		t.Fatalf("期望 3 条消息全部落库, 实际 %d 条: %+v", len(msgs), msgs)
+	}
+	hasContent(t, msgs, "beyond-save-timeout")
+	hasContent(t, msgs, "reply-one")
 }
 
 // cancelingProvider 首次 Generate 即取消调用方 ctx 并返回 context.Canceled，

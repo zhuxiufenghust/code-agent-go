@@ -18,9 +18,9 @@ type WriteTool struct {
 type WriteToolOption func(*WriteTool)
 
 type writeInput struct {
-	FilePath    string `json:"file_path"`
-	Content     string `json:"content"`
-	Overwrite   bool   `json:"overwrite,omitempty"`
+	FilePath  string `json:"file_path"`
+	Content   string `json:"content"`
+	Overwrite bool   `json:"overwrite,omitempty"`
 }
 
 func NewWriteTool(workDir string, options ...WriteToolOption) *WriteTool {

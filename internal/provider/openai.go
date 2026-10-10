@@ -38,6 +38,19 @@ func ToRequestOptions(opts config.OpenAIOptions) []option.RequestOption {
 	return requestOptions
 }
 
+// thinkingModeOptions 决定是否在请求体中关闭模型的 thinking 模式。
+// IncludeReasoning=false 意味着推理内容不回传、不展示，此时若放任 hy4-preview
+// 这类思考模型继续思考，等于为一段注定被丢弃的隐藏 reasoning token 付费，
+// 因此通过请求体附加 thinking={"type":"disabled"} 显式关闭。
+// 参数名依据腾讯云知识引擎（lkeap）OpenAI 兼容接口文档，DeepSeek/Qwen 兼容网关同样认这种写法
+// （enable_thinking 是混元官方/阿里百炼的写法，lkeap 实测无效）。
+func thinkingModeOptions(cfg *config.OpenAIConfig) []option.RequestOption {
+	if cfg == nil || cfg.IncludeReasoning {
+		return nil
+	}
+	return []option.RequestOption{option.WithJSONSet("thinking", map[string]any{"type": "disabled"})}
+}
+
 func NewOpenAIProvider(cfg *config.OpenAIConfig) *OpenAIProvider {
 	apiKey := os.Getenv(cfg.ApiKeyEnv)
 	apiBaseUrl := os.Getenv(cfg.BaseURLEnv)
@@ -77,7 +90,7 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, msgs []schema.Messa
 		reqParams.Tools = tools
 	}
 
-	stream := p.client.Chat.Completions.NewStreaming(ctx, reqParams)
+	stream := p.client.Chat.Completions.NewStreaming(ctx, reqParams, thinkingModeOptions(p.config)...)
 
 	base.GoWrap(func() {
 		defer close(ch)
@@ -137,7 +150,7 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, msgs []schema.Messa
 		if err := stream.Err(); err != nil {
 			sendStreamChunk(ctx, ch, schema.StreamChunk{
 				Type: schema.StreamChunkError,
-				Err:  err,
+				Err:  explainTransportError(err, p.config),
 			})
 			return
 		}

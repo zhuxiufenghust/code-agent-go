@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,12 +19,16 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	log.NewLogger(&zap.Config{
+	err := log.NewLogger(&zap.Config{
 		Level:            zap.NewAtomicLevelAt(zap.ErrorLevel),
 		Encoding:         "console",
 		OutputPaths:      []string{"stderr"},
 		ErrorOutputPaths: []string{"stderr"},
 	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "初始化日志失败:", err)
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }
 
@@ -316,5 +321,51 @@ func TestSQLiteSession_IndependentSessions(t *testing.T) {
 	}
 	if len(m2) != 0 {
 		t.Errorf("s2 期望 0 条, 实际 %d", len(m2))
+	}
+}
+
+// TestSQLiteSession_AddMessagesRespectsCtxUnderLock 验证锁竞争下 AddMessages 受 ctx 约束：
+// 此前 Begin/INSERT 不携带 ctx，SQLite 写锁被其他连接持有时会脱离 saveTimeout
+// 无限等待（或立刻报 database is locked 而非反映 ctx 超时）。
+func TestSQLiteSession_AddMessagesRespectsCtxUnderLock(t *testing.T) {
+	home := t.TempDir()
+	sess, err := NewSQLiteSession("locked-sess", home)
+	if err != nil {
+		t.Fatalf("NewSQLiteSession 返回错误: %v", err)
+	}
+	defer sess.db.Close()
+
+	// 第二个连接持有写事务，模拟并发会话/进程占用 SQLite 锁。
+	blocker, err := sql.Open("sqlite", filepath.Join(home, dbPath))
+	if err != nil {
+		t.Fatalf("打开阻塞连接失败: %v", err)
+	}
+	defer blocker.Close()
+	btx, err := blocker.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("开始阻塞事务失败: %v", err)
+	}
+	if _, err := btx.Exec(`INSERT OR IGNORE INTO sessions (id, created_at, updated_at) VALUES ('lock-holder', 0, 0)`); err != nil {
+		t.Fatalf("占锁写入失败: %v", err)
+	}
+	defer btx.Rollback()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sess.AddMessages(ctx, []schema.Message{{Role: schema.UserRole, Content: "x"}})
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("锁被占时 AddMessages 不应成功")
+		}
+		if !strings.Contains(err.Error(), "context deadline exceeded") {
+			t.Fatalf("错误应反映 ctx 超时（Begin/INSERT 需携带 ctx）, 实际: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AddMessages 在锁竞争下无限阻塞：Begin/INSERT 未携带 ctx")
 	}
 }

@@ -31,10 +31,12 @@ type AgentEngine struct {
 
 	maxConcurrentTools int
 	toolTimeout        time.Duration
-	generateRetries    int           // LLM 生成调用最大尝试次数（默认 3）
-	generateRetryBase  time.Duration // 重试退避基准（默认 1s）
-	workDir            string
-	homeDir            string
+	// runTimeout 是整轮流式运行的总时长上限，0 表示回落到 DefaultRunTimeout。
+	runTimeout        time.Duration
+	generateRetries   int           // LLM 生成调用最大尝试次数（默认 3）
+	generateRetryBase time.Duration // 重试退避基准（默认 1s）
+	workDir           string
+	homeDir           string
 	// usage 是本会话（本 AgentEngine）累计的 token 用量，
 	// 由 generateWithRetry 在每次 LLM 调用成功后累计，与 Provider 级用量解耦。
 	usage schema.Usage
@@ -65,6 +67,14 @@ func WithMaxLoopTurns(max int) Option {
 func WithMaxConcurrentTools(max int) Option {
 	return func(e *AgentEngine) {
 		e.maxConcurrentTools = max
+	}
+}
+
+// WithRunTimeout 设置整轮流式运行的总时长上限。
+// 传 <=0 时表示不指定，仍由 engine 内部回落默认上限。
+func WithRunTimeout(timeout time.Duration) Option {
+	return func(e *AgentEngine) {
+		e.runTimeout = timeout
 	}
 }
 
@@ -312,22 +322,25 @@ func toolCallsSignature(calls []schema.ToolCall) string {
 	return b.String()
 }
 
-// saveTimeout 是收尾落库的独立超时。
+// saveTimeout 是单次落库的独立超时。
 // runLoop 返回时 processCtx 往往已经超时或被取消（用户中断、到达运行上限），
-// 若沿用同一个 ctx 写库会立即失败，本轮进度会整体丢失。
+// 若沿用同一个 ctx 写库会立即失败，本轮进度会整体丢失，因此落库必须脱离调用方 ctx 的取消链路。
 const saveTimeout = 3 * time.Second
 
 func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string) error {
-	// 落盘 ctx 必须脱离调用方 ctx 的取消链路，保证 defer 收尾时仍可写入。
-	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), saveTimeout)
-	defer cancelSave()
-
 	var turnCount int
 	tools := e.registry.GetAvailableTools()
 	llmContext, startIndex := e.LoadHistoryContext(ctx, userPrompt)
 
 	// persist 把 llmContext 中尚未落库的部分追加写入会话并推进边界，可重复调用。
+	//
+	// 超时 ctx 必须在每次调用内部新建：persist 在整个循环里会被反复调用
+	// （每个 assistant 消息后、每批工具结果后），若像"收尾兜底"那样在循环外
+	// 只建一次，3s 配额会在第一次写入就耗尽，之后每一次都必定 deadline exceeded，
+	// 结果是本轮整份上下文一条都存不下来。
 	persist := func() {
+		saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), saveTimeout)
+		defer cancelSave()
 		startIndex = e.SaveHistoryContext(saveCtx, llmContext, startIndex)
 	}
 

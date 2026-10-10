@@ -25,16 +25,27 @@ import (
 	"go.uber.org/zap"
 )
 
+// loadEnv 依次尝试当前目录与应用级 home 目录下的 .env。
+// 只靠 "./.env" 会让"换个目录启动"静默丢掉所有 LLM 配置，
+// 症状是第一次调用才报难以定位的传输层错误。
 func loadEnv() {
 	candidates := []string{".env"}
 	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates, filepath.Join(home, ".env"))
+		candidates = append(candidates,
+			// 与 sessions.db、skills 的 homeDir 约定保持一致
+			filepath.Join(home, ".code-agent-go", ".env"),
+			filepath.Join(home, ".env"),
+		)
 	}
 	for _, path := range candidates {
 		if err := godotenv.Load(path); err == nil {
-			break
+			return
 		}
 	}
+	// 一个都没加载成功：此时 logger 尚未初始化，只能用 logfmt 打到 stderr。
+	// 不提示的话用户会一路跑到 LLM 调用失败，却不知道原因在这里。
+	fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main",
+		fmt.Sprintf("未找到 .env（已尝试: %v），LLM 相关环境变量可能缺失", candidates)))
 }
 
 func getDir() (string, string) {
@@ -59,7 +70,13 @@ func main() {
 	homeDir, workDir := getDir()
 	parseFlags(homeDir, workDir)
 	cfg := normalizeConfig()
-	log.NewLogger(cfg.Log.ToZapConfig())
+	// 日志初始化失败必须 fail fast：日志是不可观测性的基础设施，
+	// 静默降级会让排障时"什么都没记录"而毫无察觉。此时 logger 尚未就绪，
+	// 只能用 logfmt 打到 stderr 让用户看到可操作信息。
+	if err := log.NewLogger(cfg.Log.ToZapConfig()); err != nil {
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("初始化日志失败: %v", err)))
+		os.Exit(1)
+	}
 
 	printConfig(cfg)
 
@@ -70,6 +87,13 @@ func main() {
 	// 仅在真实终端下输出，避免污染管道/CI 日志。
 	if term := os.Getenv("TERM"); term != "" && term != "dumb" {
 		fmt.Fprint(os.Stdout, "\033[3J")
+	}
+	// LLM 配置必须在"发第一个请求之前"校验：BaseURL/Key 缺失会让 openai-go
+	// 构造出空 host 的请求，报错是 `unsupported protocol scheme ""`，
+	// 既不提 BaseURL 也不提环境变量名，排查成本极高。
+	if err := provider.ValidateConfig(cfg.OpenAI); err != nil {
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("LLM 配置不可用: %v", err)))
+		os.Exit(1)
 	}
 	pr := provider.NewOpenAIProvider(cfg.OpenAI)
 	registry := registerTools(homeDir, workDir)
@@ -99,6 +123,7 @@ func main() {
 	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
 		engine.WithHomeDir(homeDir),
 		engine.WithSessionID(sessID), engine.WithMaxLoopTurns(cfg.Engine.MaxLoopTurns),
+		engine.WithRunTimeout(cfg.Engine.RunTimeout),
 		// 压缩配置由 ApplyDefaults 补齐，这里无条件装配（缺配置不再等于关闭压缩）。
 		engine.WithCompactor(buildCompactor(cfg, pr)),
 	)

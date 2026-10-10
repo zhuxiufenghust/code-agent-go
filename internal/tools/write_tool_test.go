@@ -121,9 +121,9 @@ func TestWriteTool_OverwriteTrue(t *testing.T) {
 	dir := writeTempFileInDir(t, "exists.txt", "original")
 	tool := NewWriteTool(dir)
 	input, _ := json.Marshal(map[string]interface{}{
-		"file_path":  "exists.txt",
-		"content":    "updated",
-		"overwrite":  true,
+		"file_path": "exists.txt",
+		"content":   "updated",
+		"overwrite": true,
 	})
 	if _, err := tool.Execute(context.Background(), input); err != nil {
 		t.Fatalf("执行失败: %v", err)

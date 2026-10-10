@@ -136,8 +136,8 @@ func TestBashTool_InputTimeout(t *testing.T) {
 	tool := NewBashTool(t.TempDir())
 	// 超时 1 秒，命令需要 2 秒，应被中断
 	input, _ := json.Marshal(map[string]interface{}{
-		"command":       "sleep 2",
-		"timeout_secs":  1,
+		"command":      "sleep 2",
+		"timeout_secs": 1,
 	})
 	start := time.Now()
 	_, err := tool.Execute(context.Background(), input)

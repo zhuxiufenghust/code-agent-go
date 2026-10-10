@@ -176,3 +176,34 @@ func TestIsDangerousCommandCustomPatterns(t *testing.T) {
 		t.Fatal("配置黑名单应生效")
 	}
 }
+
+// TestIsDangerousCommandWordBoundary 验证黑名单按"命令边界"命中：
+// "ls" 不得误伤 "tools"、JSON 参数文本等子串，也不得命中 lsblk 这类
+// 只是前缀包含 "ls" 的其他命令；真命中（含链式命令中的 ls）必须放行给审批。
+func TestIsDangerousCommandWordBoundary(t *testing.T) {
+	h := NewApprovalManager([]string{"ls", "ls -la", "rm -rf *"})
+	negative := []string{
+		"go test ./internal/tools/", // "ls" 是 "tools" 的子串
+		"cat tools.txt",
+		"lsblk",        // 前缀包含 "ls" 的另一个命令
+		"git status",   // 命令与参数均无 ls
+		"echo analyze", // "ls" 是 "analyze" 的子串
+	}
+	for _, cmd := range negative {
+		args, _ := json.Marshal(map[string]string{"command": cmd})
+		if h.IsDangerousCommand("bash_tool", string(args)) {
+			t.Errorf("不应判为危险（子串误伤）: %q", cmd)
+		}
+	}
+	positive := []string{
+		"ls",
+		"ls -la /tmp",
+		"cd /tmp && ls -la", // 链式命令中间的 ls 同样危险
+	}
+	for _, cmd := range positive {
+		args, _ := json.Marshal(map[string]string{"command": cmd})
+		if !h.IsDangerousCommand("bash_tool", string(args)) {
+			t.Errorf("应判为危险: %q", cmd)
+		}
+	}
+}

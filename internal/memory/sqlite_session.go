@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -132,18 +133,25 @@ func (s *SQLiteSession) init() error {
 	if err := os.MkdirAll(filepath.Dir(dbFilePath), 0700); err != nil {
 		return fmt.Errorf("创建数据库目录: %w", err)
 	}
-	db, err := sql.Open("sqlite", dbFilePath)
+	// PRAGMA 必须写在 DSN 上：经 db.Exec 执行的 PRAGMA 只作用于当时借到的那一个
+	// 连接，连接池里的其他连接不会生效（foreign_keys 曾因此时开时关）。
+	// busy_timeout 让写锁被并发连接短暂占用时先等待而不是立刻 SQLITE_BUSY；
+	// 实测驱动的 busy sleep 无法被 ctx 打断，等待上界完全由 busy_timeout 决定，
+	// 因此必须显著小于调用方的 saveTimeout(3s)，否则锁竞争会把落库拖到超时之外。
+	dsn := (&url.URL{
+		Scheme: "file",
+		Path:   dbFilePath,
+		RawQuery: "_pragma=journal_mode(WAL)" +
+			"&_pragma=foreign_keys(1)" +
+			"&_pragma=busy_timeout(1000)",
+	}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("打开数据库: %w", err)
 	}
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return fmt.Errorf("设置 pragma: %w", err)
-		}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return fmt.Errorf("连接数据库: %w", err)
 	}
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
@@ -213,7 +221,9 @@ func (s *SQLiteSession) GetMessages(ctx context.Context, limit int) ([]schema.Me
 	return msgs, nil
 }
 func (s *SQLiteSession) AddMessages(ctx context.Context, msgs []schema.Message) error {
-	tx, err := s.db.Begin()
+	// Begin/INSERT 都必须携带 ctx：锁被其他连接持有时（并发会话/进程），
+	// 不带 ctx 的等待会脱离 saveTimeout 约束，还会把报错拖到 UPDATE 才暴露。
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开始事务: %w", err)
 	}
@@ -238,7 +248,7 @@ func (s *SQLiteSession) AddMessages(ctx context.Context, msgs []schema.Message) 
 			}
 		}
 
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			"INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, is_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 			s.sessionID, msg.Role, msg.Content, toolCallsJS, msg.ToolCallID, boolToInt(msg.IsError), now,
 		); err != nil {
