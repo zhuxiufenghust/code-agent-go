@@ -29,6 +29,37 @@ make build
 | `-y, --approve` | **本次会话**放行高危命令（等价临时 `trusted`，不写盘） |
 | `--trust LEVEL` | 设置并持久化信任态：`trusted`/`untrusted`/`undecided` |
 | `--metrics` | 打开指标导出（单行 JSON，默认 stderr，详下） |
+| `-p, --print` | 无头运行：不启动 TUI，任务跑完直接退出（不给任务参数时从 stdin 读） |
+| `--output text\|json` | 无头模式的输出形态，`json` 为单行 JSON 事件流（默认 `text`） |
+| `--show-thinking` | 无头模式下同时打印推理增量 |
+
+## 无头模式（CI / 管道 / 容器）
+
+不需要 TTY 的运行方式。三种触发方式等价：**显式 `-p`**、**stdout 被重定向**、**stdin 是管道**
+（`echo "..." | code-agent-go`），满足任一即不启动 TUI。
+
+```bash
+# 任务作为位置参数，答案重定向到文件（stdout 只有助手正文，诊断信息全在 stderr）
+code-agent-go -p "给 utils.go 的 ParseSize 补单元测试" > answer.md
+
+# 管道输入
+cat task.txt | code-agent-go
+
+# 机器可读：所有事件为单行 JSON，末行 type=result 带轮次/工具统计/token 用量
+code-agent-go -p "列出目录" --output json | jq 'select(.type=="result")'
+```
+
+要点：
+
+- **stdout / stderr 分离**：`text` 模式下 stdout 只有助手正文（便于 `>` 落文件），
+  工具调用、运行摘要、日志一律走 stderr；`json` 模式下 stdout 全是结构化行，stderr 保持干净。
+- **高危命令默认拒绝**：无头模式没有审批通道，`rm -rf` 一类命令会被拒绝并回灌给模型自愈；
+  确实要放行请显式 `-y` / `--trust trusted`，让"授权"留在命令行上可见。
+- **退出码**：`0` 完成（工具失败不算运行失败：错误已回灌上下文让模型自愈）、
+  `1` 参数或运行错误、`130` 被 SIGINT/SIGTERM 中断。
+- **JSON 事件**：与 TUI 同源的 `thinking_delta / action_delta / tool_start / tool_result /
+  usage / compaction / approval_required / done`，最后补一行
+  `{"type":"result","data":{"text":...,"turns":...,"tool_calls":...,"tool_errors":...,"usage":{...}}}`。
 
 ## 配置
 
@@ -82,10 +113,12 @@ docker build -t code-agent-go:latest .
   会话 SQLite、长期记忆库、信任态文件都在那里，容器里务必给 `HOME` 挂可写卷或匿名卷。
 - **配置文件里的日志路径必须是相对路径**
   （历史版本里有 `/Users/...` 的绝对路径，进容器后创建日志文件必然失败）。
-- **需要 TTY**：当前入口仍是交互式 TUI，无头模式（`--print`）尚未实现，
-  容器内请 `docker run -it --rm ...`。无头模式落地后应改为非交互入口。
+- **要不要 TTY**：交互式沿用 `docker run -it`；无头流水线不需要 TTY，
+  把任务作为参数传入即可（`-p` 可省略：无 TTY 时自动走无头路径）。
 
 ### 运行
+
+交互：
 
 ```bash
 docker run -it --rm \
@@ -94,6 +127,16 @@ docker run -it --rm \
   -v "$HOME/.code-agent-go:/home/nonroot/.code-agent-go" \
   -v "$(pwd):/workspace" -w /workspace \
   code-agent-go:latest -c /app/conf/config.json
+```
+
+无头（CI / 定时任务，不需要 TTY）：
+
+```bash
+docker run --rm \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -e OPENAI_BASE_URL="$OPENAI_BASE_URL" \
+  -v "$(pwd):/workspace" -w /workspace \
+  code-agent-go:latest -c /app/conf/config.json -p "跑一遍 go test 并汇报失败用例"
 ```
 
 ### 可观测性

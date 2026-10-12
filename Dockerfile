@@ -33,8 +33,9 @@ COPY conf/config.json /app/conf/config.json
 ENV HOME=/home/nonroot
 ENV XDG_CONFIG_HOME=/home/nonroot/.config
 
-# 当前入口仍是交互式 TUI（无头模式 --print 属于第 3 周遗留项，尚未实现），
-# 因此容器内运行必须带 TTY：docker run -it --rm <image>
-# 一旦无头模式落地，这里应改为固定 --print 之类的非交互参数。
+# 两种用法都支持，取决于有没有终端：
+#   - 交互（有 TTY）：docker run -it --rm <image>
+#   - 无头（无 TTY）：docker run --rm <image> -p "任务描述"
+# 无 TTY 时入口会自动走无头路径（见 internal/headless），不再因为拿不到终端而直接失败。
 ENTRYPOINT ["/app/code-agent-go"]
 CMD ["--config", "/app/conf/config.json"]

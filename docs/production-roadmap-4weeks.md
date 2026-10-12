@@ -195,7 +195,7 @@
 |---|---|---|
 | D10~D11 Skills 真正注入 + 按需加载 | ✅ | `internal/skill/skill_dispatcher.go` 按 `skill_name` 注入 Skill.Body（幂等，重复加载只回执）；测试 `skill_dispatcher_test.go` |
 | D12 工具结果按序回填 + 耗时事件 | ✅ | `executeTools` 按下标回填、`EventToolResult` 携带 `Duration` |
-| D13 无头 / 非交互模式 | ❌ | `cmd/main.go` 仍只启动 TUI；需 `--print` / `--output json` / 非 TTY 探测。W4 复核：非 TTY 下直接报 `could not open a new TTY` 退出（见"W4 复核补记"） |
+| D13 无头 / 非交互模式 | ✅ | 新增 `internal/headless/`（`Runner` 消费 `StreamRun` 事件、`ShouldRunHeadless` TTY 判定、`ReadPrompt`）；`cmd/main.go` 接入 `-p/--print`、`--output text\|json`、`--show-thinking`，详见下方"W4 复核补记"与新增小节 |
 | D14 多 Provider 路由 | 🟡 | W4 补上了 `provider.Register/New` 工厂与 `models` 段（`internal/provider/factory.go`），但仅 OpenAI 兼容实现一种，Anthropic 仍未落地 |
 
 ### 第 4 周：可观测、信任态与工程化收尾
@@ -235,14 +235,36 @@
 | D18 LTM 落地 | ✅ `ltm.enabled=true` 启动时注册 `remember_tool`/`recall_tool` 并在 `~/.code-agent-go/data` 建库 |
 | D20 镜像可运行 | ✅ `make docker-build` 出 `code-agent-go:latest`（19.3MB）；`docker run --rm` 静态二进制正常启动并加载配置（distroless + nonroot） |
 
-**复核暴露的两个遗留项（建议列为下一迭代首位）**
+**复核当时暴露的遗留项及处置**
 
-1. **D13 无头模式缺失已构成硬失败**：非 TTY 环境下（含 `docker run -i`、CI 管道）进程直接
-   `错误: could not open a new TTY` 退出，而不是降级为 `--print` 输出。
-2. **该退出路径还会丢最后一帧指标**：走的是提前 `os.Exit`，`defer obs.Close()` 不执行，
-   于是"开了 `--metrics` 却拿不到收尾快照"。实现 D13 时应一并补优雅退出（`Close` 后再退出）。
+1. ~~**D13 无头模式缺失构成硬失败**：非 TTY 环境下进程直接 `could not open a new TTY` 退出~~
+   → 已修复，见下方"W3 遗留补齐：无头模式（D13）"。
+2. ~~**该退出路径丢最后一帧指标**：提前 `os.Exit` 使 `defer obs.Close()` 不执行~~
+   → 已修复：`main` 改为 `os.Exit(run())`，退出码冒泡，`defer` 全部按序执行。
 3. D8 `LoadHistoryContext` TODO 仍在（`internal/engine/agent_loop.go`），`--resume/--continue` 缺位，
    续跑只能 `-s <session-id>` 手工指定。
+
+### W3 遗留补齐：无头模式（D13）
+
+W4 收尾时补上了这条原来标红的项，并入 `week_seven`：
+
+| 能力 | 落点 |
+|---|---|
+| 非交互运行入口 | `internal/headless/runner.go`：`Runner.Run` 消费同源于 TUI 的 `StreamRun` 事件流 |
+| TTY 判定 | `ShouldRunHeadless`：`-p` 无条件无头；stdout 非终端（重定向/管道）或 stdin 为管道即无头 |
+| 任务输入 | `ReadPrompt`：位置参数 > stdin（stdin 为终端时不读，避免等 EOF 假死） |
+| 输出形态 | `text`（stdout 只放助手正文、诊断走 stderr）/ `json`（全部单行 JSON，末行 `type=result`） |
+| 审批降级 | 高危命令在无 TTY 下自动拒绝并回灌模型自愈；要放行必须显式 `-y`/`--trust trusted` |
+| 退出码 | `0` 完成 / `1` 参数或运行错误 / `130` 被 SIGINT、SIGTERM 中断 |
+
+**实跑验证**（本地假 OpenAI 兼容服务 + 真二进制）：
+
+- `-p "你好" > answer.md`：stdout 只有答案，工具调用与 `—— 轮次=2 工具调用=1 ...` 摘要在 stderr；
+- `echo "任务" | code-agent-go`：无 `-p` 也自动走无头并产出答案；
+- `--output json`：7 行事件中末行为 `{"type":"result",...}`，可被 `jq` 直接筛选；
+- 高危 `rm -rf`：`高危命令被拒=1`、目标目录**仍在**；加 `-y` 后同一条命令真的执行（控制变量对照）；
+- 运行中 SIGINT：退出码 `130`，并且退出前仍然导出最后一帧 `{"type":"metrics"}`；
+- 缺输入：打印使用提示并退出 `1`。
 
 ---
 
