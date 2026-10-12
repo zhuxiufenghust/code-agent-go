@@ -4,32 +4,64 @@
         "development": false,
         "disableCaller": false,
         "disableStacktrace": false,
-        "outputPaths": ["logs/app.log"],
-        "errorOutputPaths": ["logs/app.log"]
+        "outputPaths": ["stderr"],
+        "errorOutputPaths": ["stderr"]
     },
     "openai": {
-        "model": "hy3",
+        "model": "hy4-preview",
         "baseURLEnv": "TEST_OPENAI_BASE_URL",
         "apiKeyEnv": "TEST_OPENAI_API_KEY",
-        "options": {
-        }
+        "includeReasoning": false
+    },
+    "models": {
+        "default": "default",
+        "items": [
+            {
+                "name": "default",
+                "provider": "openai",
+                "model": "hy4-preview",
+                "baseURLEnv": "TEST_OPENAI_BASE_URL",
+                "apiKeyEnv": "TEST_OPENAI_API_KEY",
+                "includeReasoning": false,
+                "maxRetries": 3
+            }
+        ]
     },
     "engine": {
-        "maxConcurrentTools": 10
+        "maxConcurrentTools": 10,
+        "runTimeout": 900000000000
+    },
+    "token": {
+        "contextWindow": 200000,
+        "warnRatio": 0.8
     },
     "compactor": {
         "strategy": "summarization",
-        "contextWindow": 200000,
         "minTail": 6
     },
     "tool": {
         "enableApproval": true,
         "dangerCmds": ["ls -la", "rm -rf *", "ls"]
     },
-    "skill": {
+    "memory": {
+        "persistence": true
     },
-    "compactor": {
-        "contextWindow": 200000000,
-        "minTail":6
+    "ltm": {
+        "enabled": false,
+        "maxResults": 5
+    },
+    "sandbox": {
+        "enabled": false,
+        "image": "ubuntu:22.04",
+        "networkDisabled": true,
+        "readOnlyRootfs": false,
+        "timeoutSecs": 120
+    },
+    "observability": {
+        "enabled": false,
+        "exporter": "stderr",
+        "dumpIntervalSecs": 30
+    },
+    "skill": {
     }
 }

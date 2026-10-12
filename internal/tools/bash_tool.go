@@ -4,18 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
 	"time"
 
+	"github.com/zhuxiufenghust/code-agent-go/internal/sandbox"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
 )
 
 type BashTool struct {
 	schema.ToolDefinition
-	workDir      string
-	timeout      time.Duration // 单条命令超时；0 时使用 defaultBashTimeout
-	maxOutputLen int           // 最大输出长度，防止内存溢出 默认 0 时不限制
+	workDir string
+	timeout time.Duration // 单条命令超时；0 时使用 defaultBashTimeout
+	// runner 决定命令到底跑在哪：宿主机（默认）还是一次性容器（见 sandbox 配置）。
+	runner sandbox.Runner
+	// maxOutputLen 最大输出长度，防止内存溢出 默认 0 时不限制
+	maxOutputLen int
 	// blockCommands 阻塞的命令列表，默认空列表
 }
 type bashInput struct {
@@ -34,6 +36,16 @@ type BashOption func(*BashTool)
 func WithMaxOutputLen(maxOutputLen int) BashOption {
 	return func(t *BashTool) {
 		t.maxOutputLen = maxOutputLen
+	}
+}
+
+// WithRunner 替换命令执行体，用于在沙箱（容器）中运行命令。
+// 默认使用 sandbox.Local：与宿主机直跑语义一致，便于测试与本地开发。
+func WithRunner(r sandbox.Runner) BashOption {
+	return func(t *BashTool) {
+		if r != nil {
+			t.runner = r
+		}
 	}
 }
 
@@ -58,6 +70,7 @@ func NewBashTool(workDir string, options ...BashOption) *BashTool {
 			},
 		},
 		workDir: workDir,
+		runner:  sandbox.Local{},
 	}
 	for _, opt := range options {
 		opt(t)
@@ -98,45 +111,17 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return t.runLocal(ctx, params.Command)
-}
-
-func (t *BashTool) runLocal(ctx context.Context, cmd string) (string, error) {
-	tmp, err := os.CreateTemp("", "harness9-bash-*.log")
+	out, err := t.runner.Run(ctx, t.workDir, params.Command)
 	if err != nil {
-		return "", fmt.Errorf("创建临时输出文件失败：%w", err)
-	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
-
-	c := exec.CommandContext(ctx, "bash", "-c", cmd)
-	c.Dir = t.workDir
-	c.Stdout = tmp
-	c.Stderr = tmp
-	err = c.Run()
-	if err != nil {
-		// context 超时/取消时，进程被强杀，c.Run 返回的是 "signal: killed" 之类，
-		// 不含"超时"关键字，自愈提示无法识别。这里显式转译为带"超时"的错误，
-		// 便于 RecoveryManager 注入 [系统救援指南]。
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("执行命令失败（超时）：%w", err)
-		}
-		if ctx.Err() == context.Canceled {
-			return "", fmt.Errorf("执行命令失败（已取消）：%w", err)
-		}
-		return "", fmt.Errorf("执行命令失败：%w", err)
-	}
-	out, readErr := os.ReadFile(tmp.Name())
-	if readErr != nil {
-		return "", fmt.Errorf("读取命令输出失败：%w", readErr)
+		return "", err
 	}
 	if t.maxOutputLen > 0 {
 		if len(out) > t.maxOutputLen {
 			out = out[:t.maxOutputLen]
 		}
 	}
-	if len(out) == 0 {
-		out = []byte("命令执行成功，无终端输出。")
+	if out == "" {
+		out = "命令执行成功，无终端输出。"
 	}
-	return string(out), nil
+	return out, nil
 }
