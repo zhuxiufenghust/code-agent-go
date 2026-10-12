@@ -55,9 +55,9 @@ func (e *AgentEngine) runTimeoutOrDefault() time.Duration {
 // ToolResultData 是 EventToolResult 事件的载荷，携带工具执行结果和引擎侧精确耗时。
 type ToolResultData struct {
 	// Result 是工具执行的结果。
-	Result schema.ToolResult
+	Result schema.ToolResult `json:"result"`
 	// Duration 是工具在引擎侧的精确执行耗时（从工具函数入口到返回的真实时长，不含 channel 传输延迟）。
-	Duration time.Duration
+	Duration time.Duration `json:"duration_ns"`
 }
 
 type Event struct {

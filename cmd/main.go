@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/uuid"
@@ -13,6 +18,7 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
 	"github.com/zhuxiufenghust/code-agent-go/internal/context_mng"
 	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
+	"github.com/zhuxiufenghust/code-agent-go/internal/headless"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
 	"github.com/zhuxiufenghust/code-agent-go/internal/ltm"
 	"github.com/zhuxiufenghust/code-agent-go/internal/observability"
@@ -70,7 +76,17 @@ func getDir() (string, string) {
 	return homeDir, workDir
 }
 
+// main 只做一件事：把 run 的返回码交给 os.Exit。
+//
+// 之所以要多这一层：run 内部持有需要 defer 释放的资源（LTM 库、指标导出器），
+// 而 os.Exit 不执行 defer。若在各分支里就地 os.Exit，就会出现
+// "开了 --metrics 却在退出时拿不到收尾快照"这种静默数据丢失；
+// 把退出码冒泡到这里，所有 defer 都在进程退出前按序跑完。
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	loadEnv()
 
 	homeDir, workDir := getDir()
@@ -81,7 +97,7 @@ func main() {
 	// 只能用 logfmt 打到 stderr 让用户看到可操作信息。
 	if err := log.NewLogger(cfg.Log.ToZapConfig()); err != nil {
 		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("初始化日志失败: %v", err)))
-		os.Exit(1)
+		return 1
 	}
 
 	printConfig(cfg)
@@ -90,26 +106,24 @@ func main() {
 	// 若用户在 TUI 运行期间滚动终端（滚轮/滚动条），仍会露出启动前的主屏输出
 	// （如配置快照、历史命令）。\033[3J 在进入 alt screen 前擦除滚动历史，
 	// 使上滚只能看到空白。\033[2J\033[H 由 alt screen 替代，此处省略。
-	// 仅在真实终端下输出，避免污染管道/CI 日志。
-	if term := os.Getenv("TERM"); term != "" && term != "dumb" {
-		fmt.Fprint(os.Stdout, "\033[3J")
-	}
+	// 仅在真实终端下输出，避免污染管道/CI 日志；无头模式同样不能写这段控制序列，
+	// 否则 `app -p "..." > answer.md` 会得到一个以转义序列开头的文件。
 	// LLM 配置必须在"发第一个请求之前"校验：BaseURL/Key 缺失会让 openai-go
 	// 构造出空 host 的请求，报错是 `unsupported protocol scheme ""`，
 	// 既不提 BaseURL 也不提环境变量名，排查成本极高。
 	modelCfg, err := cfg.Models.ResolveModel(cliOp.model)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("模型选择失败: %v", err)))
-		os.Exit(1)
+		return 1
 	}
 	if err := provider.ValidateModel(modelCfg); err != nil {
 		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("LLM 配置不可用: %v", err)))
-		os.Exit(1)
+		return 1
 	}
 	pr, err := provider.New(modelCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("构造 Provider 失败: %v", err)))
-		os.Exit(1)
+		return 1
 	}
 	registry := registerTools(homeDir, workDir, cfg)
 	ltmStore := openLTM(homeDir, cfg, registry)
@@ -165,6 +179,17 @@ func main() {
 		approvalMgr.SetEmitGetter(agent)
 	}
 
+	// 无头判定必须在启动 TUI 之前：一旦 tea.NewProgram 跑起来，
+	// 在非 TTY 环境（CI、管道、docker run 不带 -t）里会以
+	// "could not open a new TTY" 直接失败，任务根本没机会执行。
+	if headless.ShouldRunHeadless(os.Stdin, os.Stdout, cliOp.print) {
+		return runHeadless(agent)
+	}
+
+	if term := os.Getenv("TERM"); term != "" && term != "dumb" {
+		fmt.Fprint(os.Stdout, "\033[3J")
+	}
+
 	p := tea.NewProgram(tui.New(workDir, modelCfg.Model, agent),
 		tea.WithAltScreen(),
 		// 启用鼠标(含滚轮)捕获：滚轮事件会作为 tea.MouseWheelMsg 交给程序，
@@ -172,9 +197,61 @@ func main() {
 		tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
-		os.Exit(1)
+		return 1
+	}
+	return 0
+}
+
+// runHeadless 执行一次非交互运行，返回进程退出码。
+//
+// 退出码约定（脚本据此分支处理）：
+//   - 0  运行完成（即便中途有工具失败：工具错误已回灌上下文让模型自愈，不算运行失败）
+//   - 1  参数/配置/运行错误
+//   - 130 被 SIGINT/SIGTERM 中断（与 shell 惯例一致）
+func runHeadless(agent *engine.AgentEngine) int {
+	format, err := headless.ParseFormat(cliOp.output)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", err.Error()))
+		return 1
+	}
+	prompt, err := headless.ReadPrompt(flag.Args(), os.Stdin, headless.IsTerminal(os.Stdin) == false)
+	if err != nil {
+		if errors.Is(err, headless.ErrNoPrompt) {
+			fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main",
+				"无头模式缺少任务输入：请把任务作为位置参数传入，或通过 stdin 管道输入（例：echo \"hi\" | code-agent-go -p）"))
+			return 1
+		}
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("读取任务输入失败: %v", err)))
+		return 1
 	}
 
+	// 中断信号走 context 取消而不是直接退出：这样引擎有机会收尾
+	//（关闭事件流、写会话增量），指标也能由上层 defer 导出最后一帧。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	runner := &headless.Runner{
+		Out:          os.Stdout,
+		Err:          os.Stderr,
+		Format:       format,
+		ShowThinking: cliOp.showThinking,
+	}
+	res, err := runner.Run(ctx, agent, prompt)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// 用户主动中断：脚本会用 130 区别于"任务真的失败了"。
+			fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", "运行已被中断"))
+			return 130
+		}
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", err.Error()))
+		return 1
+	}
+	// 正文在流式过程中已逐段写出，这里补一个换行，
+	// 否则 shell 提示符会紧跟在答案后面（管道场景尤其明显）。
+	if format == headless.FormatText && res.Text != "" && !strings.HasSuffix(res.Text, "\n") {
+		fmt.Fprintln(os.Stdout)
+	}
+	return 0
 }
 
 func printConfig(cfg *config.Config) {
@@ -326,6 +403,9 @@ func parseFlags(homeDir string, workDir string) {
 	flag.StringVar(&cliOp.trustLevel, "trust", "", "设置并持久化信任态：trusted|untrusted|undecided")
 	flag.BoolVar(&cliOp.metrics, "metrics", false, "导出指标快照与调用 Span（单行 JSON，默认 stderr）")
 	flag.StringVarP(&cliOp.model, "model", "m", "", "使用的模型名（对应 models.items[].name，缺省取 models.default）")
+	flag.BoolVarP(&cliOp.print, "print", "p", false, "无头运行：不启动 TUI，任务来自参数或 stdin，结果打到标准输出后退出")
+	flag.StringVar(&cliOp.output, "output", string(headless.FormatText), "无头模式的输出形态：text（正文走 stdout、诊断走 stderr）| json（全部为单行 JSON）")
+	flag.BoolVar(&cliOp.showThinking, "show-thinking", false, "无头模式下同时打印模型推理增量")
 	flag.Parse()
 
 	if configPath != "" {

@@ -14,6 +14,12 @@ type cliOptions struct {
 	metrics bool
 	// model 指定本次使用的模型名（对应 models.items[].name）
 	model string
+	// print 无头运行：跳过 TUI，直接把结果打到标准输出后退出
+	print bool
+	// output 无头模式的输出形态：text（默认）或 json（单行 JSON 事件流）
+	output string
+	// showThinking 无头模式下是否打印模型推理增量（默认关闭）
+	showThinking bool
 
 	homeDir   string
 	workDir   string
