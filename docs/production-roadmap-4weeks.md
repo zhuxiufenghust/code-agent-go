@@ -165,6 +165,87 @@
 
 ---
 
+## 二·五、进度回填（截至 W4 收尾）
+
+> 图例：✅ 已落地（含测试）｜🟡 部分落地｜❌ 未开工
+>
+> 说明：行号引用已失效时以"落点文件"为准。
+
+### 第 1 周：可靠性与安全防护（P0）
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| D1 循环终止保护（maxTurns + 卡住检测） | ✅ | `internal/engine/agent_loop.go`（`WithMaxLoopTurns`、`toolCallsSignature`）；测试 `TestStreamRun_MaxLoopTurns`、`TestStreamRun_StuckDetection` |
+| D2 工具错误自愈 | ✅ | `executeTools` 后错误回灌、`context_mng.RecoveryManager`；测试 `TestRun_ToolError` |
+| D3 工具输出截断（按工具类型给建议） | ✅ | `internal/tools/registry.go`（`truncateToolOutput`/`truncationHint`）；测试 `registry_test.go` |
+| D4 危险命令拦截 + 审批闭环 | ✅ | `internal/hooks/danger.go`（9 条规则）、`internal/tools/approve.go`；测试 `danger_test.go`、`approve_test.go` |
+| D5 Skill 目录扫描范围 | ✅ | `internal/skill/skill_loader.go` 只扫 `.config/code-agent-go/skills`（用户级 + 工作区级），不再扫 home/workDir 顶层 |
+
+### 第 2 周：Token 感知、压缩与续跑
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| D6 token 计量取代 panic | ✅ | `report.Emitter.TokenUpdate`、`AgentEngine.usage`、`EventUsage`；测试 `usage_test.go` |
+| D7 上下文压缩（摘要 + 令牌兜底 + 孤立工具对修复） | ✅ | `internal/context_mng/`（sliding/token/summarization）；测试 `compaction_test.go`、`summarization_compactor_test.go` |
+| D8~D9 会话续跑 | 🟡 | 持久化增量落库已完整（`SaveHistoryContext` + `persistence_test.go`）；但 `LoadHistoryContext` 的 TODO 未清、`--resume/--continue` 已下线，只能 `-s <session-id>` 手动续跑 |
+
+### 第 3 周：技能、流式与无头模式
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| D10~D11 Skills 真正注入 + 按需加载 | ✅ | `internal/skill/skill_dispatcher.go` 按 `skill_name` 注入 Skill.Body（幂等，重复加载只回执）；测试 `skill_dispatcher_test.go` |
+| D12 工具结果按序回填 + 耗时事件 | ✅ | `executeTools` 按下标回填、`EventToolResult` 携带 `Duration` |
+| D13 无头 / 非交互模式 | ❌ | `cmd/main.go` 仍只启动 TUI；需 `--print` / `--output json` / 非 TTY 探测。W4 复核：非 TTY 下直接报 `could not open a new TTY` 退出（见"W4 复核补记"） |
+| D14 多 Provider 路由 | 🟡 | W4 补上了 `provider.Register/New` 工厂与 `models` 段（`internal/provider/factory.go`），但仅 OpenAI 兼容实现一种，Anthropic 仍未落地 |
+
+### 第 4 周：可观测、信任态与工程化收尾
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| D15 token/耗时/工具成功率指标 | ✅ | 新增 `internal/observability/`（`Metrics` 接口、`Snapshot` 聚合）；`internal/observability/observability_test.go` |
+| D15 noop / stdout Exporter | ✅ | `observability.Nop()` / `observability.NewStdout(w, interval)`，输出单行 JSON |
+| D16 LLM / 工具 Span 埋点 | ✅ | `internal/observability/span.go` + `Instrument()` 织入 `report.Emitter`；`instrument_test.go` |
+| D17 信任态三态 + 持久化 | ✅ | 新增 `internal/trust/`（`~/.code-agent-go/trust.json`）；`internal/tools/approve.go` 接入 `trust.Decide` |
+| D17 `--approve` 会话级授权 | ✅ | `cmd/main.go`（`-y/--approve` 临时 trusted；`--trust <level>` 持久化） |
+| D18 `Models` 多模型 / `Compaction` / `Token` 阈值 | ✅ | `config.Models/Compactor/Token`（`token.contextWindow` 为单一来源）+ `provider.New` 路由 |
+| D18 `Sandbox` 开关 | ✅ | `config.Sandbox` + `internal/sandbox/`（Local / Docker 执行体，缺 docker 直接报错） |
+| D18 `LtmConfig` / `MemoryConfig` 落地 | ✅ | `internal/ltm/`（SQLite store/search）+ `remember_tool`/`recall_tool`；`memory.persistence` 开关 |
+| D19 agent_loop 关键路径单测 | ✅ | maxTurns/卡住/自愈/截断/压缩均有用例；续跑仍缺 `LoadHistoryContext` 还原用例 |
+| D20 README 生产部署小节 | ✅ | `README`："生产部署"（镜像构建/运行/采集/安全模型）+ 已知限制 |
+| D20 Dockerfile / `.env.example` | ✅ | 仓库根 `Dockerfile`（distroless 静态二进制）、`.dockerignore`、`.env.example`（区分运行期与测试变量） |
+
+### W4 周验收自检
+
+| 验收项 | 结论 |
+|---|---|
+| 一次长跑可输出 token/耗时/工具成功率指标 | ✅ `observability.enabled` 或 `--metrics` 打开即可（详见 README"可观测性"） |
+| 信任态在重启后保持 | ✅ `--trust trusted` 落盘后跨进程生效；`--approve` 仅限本次进程 |
+| `docker build` 可出镜像，README 含生产部署说明 | ✅ `make docker-build`；注意容器内仍需 TTY（无头模式属 W3 遗留） |
+
+### W4 复核补记（本机实测，非静态审查）
+
+> 方式：`gofmt -l` / `go vet ./...` 零告警；`go test -count=1 ./...` 14 个包全绿；
+> 二进制以隔离 `HOME` 实跑；临时用例验证后已删除，未入库。
+
+| 复核项 | 实测结论 |
+|---|---|
+| D15/D16 导出内容 | ✅ 一次含"工具成功 + 工具失败"的 Run 拿到 `{"type":"metrics",...}`：`elapsed_ms`、`llm.calls=2`、`tool.success_rate=0.5` 且 `by_tool` 有分工具明细、`token.total_tokens=280`；Span 同 `trace_id` 串成 `agent.run → llm.generate / tool.<name>`，失败工具的 span 带 `error` 字段 |
+| D17 跨进程持久 | ✅ `--trust trusted` 写盘 → 无参数再启动仍读到 `trusted`；`-y` 只管本次进程（`session_only:true`）且不改写 `trust.json`；`--trust undecided` 可回落 |
+| D18 Sandbox 实跑 | ✅ Docker 执行体真跑通（`echo` 输出回传、`-w /workspace` 挂载正确）；`readOnlyRootfs=true` 实测拦住工作目录写入。⚠️ 该开关只把**工作目录**挂 `:ro`，容器自身 rootfs 仍可写，字段名易被误解成"整个根只读"（README 表述是准确的） |
+| D18 LTM 落地 | ✅ `ltm.enabled=true` 启动时注册 `remember_tool`/`recall_tool` 并在 `~/.code-agent-go/data` 建库 |
+| D20 镜像可运行 | ✅ `make docker-build` 出 `code-agent-go:latest`（19.3MB）；`docker run --rm` 静态二进制正常启动并加载配置（distroless + nonroot） |
+
+**复核暴露的两个遗留项（建议列为下一迭代首位）**
+
+1. **D13 无头模式缺失已构成硬失败**：非 TTY 环境下（含 `docker run -i`、CI 管道）进程直接
+   `错误: could not open a new TTY` 退出，而不是降级为 `--print` 输出。
+2. **该退出路径还会丢最后一帧指标**：走的是提前 `os.Exit`，`defer obs.Close()` 不执行，
+   于是"开了 `--metrics` 却拿不到收尾快照"。实现 D13 时应一并补优雅退出（`Close` 后再退出）。
+3. D8 `LoadHistoryContext` TODO 仍在（`internal/engine/agent_loop.go`），`--resume/--continue` 缺位，
+   续跑只能 `-s <session-id>` 手工指定。
+
+---
+
 ## 三、每周验收清单（自检）
 
 | 周 | 必须能跑通 | 必须存在的测试 |

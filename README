@@ -1,1 +1,141 @@
-code agent implemented with go
+# code-agent-go
+
+用 Go 实现的终端侧编码 Agent：LLM 返回 tool_calls → 解析 → 执行工具 → 结果回灌，循环直到收敛。
+
+- 状态：可本地开发使用。**生产可用化的进度见 `docs/production-roadmap-4weeks.md` 末尾的"进度回填"小节。**
+- 目录约定：`~/` 下的所有运行时状态都在 `~/.code-agent-go/`（会话库、长期记忆、信任态）。
+
+## 快速开始
+
+```bash
+# 1. 准备凭证（也可以直接配 --config 指向的配置文件）
+cp .env.example .env   # 填入 OPENAI_API_KEY / OPENAI_BASE_URL
+
+# 2. 配置文件：默认读 ~/.code-agent-go/conf/config.json，也可用 -c 指定
+cp conf/config.json ~/.code-agent-go/conf/config.json
+
+# 3. 构建 & 运行
+make build
+./bin/code-agent-go -c ./conf/config.json
+```
+
+## 常用参数
+
+| 参数 | 说明 |
+|------|------|
+| `-c, --config` | 配置文件路径 |
+| `-s, --session-id` | 复用指定会话（不清空历史；不传则新建随机会话） |
+| `-m, --model` | 使用的模型名，对应 `models.items[].name`，缺省 `models.default` |
+| `-y, --approve` | **本次会话**放行高危命令（等价临时 `trusted`，不写盘） |
+| `--trust LEVEL` | 设置并持久化信任态：`trusted`/`untrusted`/`undecided` |
+| `--metrics` | 打开指标导出（单行 JSON，默认 stderr，详下） |
+
+## 配置
+
+完整样例见 `conf/config.json`，此处只说明生产相关的几段：
+
+```jsonc
+{
+  "token": {
+    "contextWindow": 200000,   // 上下文窗口，压缩阈值与水位的唯一来源
+    "warnRatio": 0.8           // 估算用量超过 80% 时打 token_window_high_water 告警
+  },
+  "models": {
+    "default": "fast",
+    "items": [
+      { "name": "fast",  "provider": "openai", "model": "gpt-4o-mini",
+        "baseURLEnv": "OPENAI_BASE_URL", "apiKeyEnv": "OPENAI_API_KEY" },
+      { "name": "smart", "provider": "openai", "model": "gpt-4o",
+        "baseURLEnv": "OPENAI_BASE_URL", "apiKeyEnv": "OPENAI_API_KEY" }
+    ]
+  },
+  "sandbox": {
+    "enabled": true,           // bash 跑进一次性容器，而不是宿主机
+    "image": "ubuntu:22.04",   // 镜像必须自带 bash
+    "networkDisabled": true,   // --network none，杜绝命令外传数据
+    "readOnlyRootfs": false    // true 时工作目录以只读方式挂载
+  },
+  "observability": {
+    "enabled": true,           // 周期导出指标快照 + 每次 Span 结束输出
+    "exporter": "stderr",      // 交互模式下别用 stdout：TUI 正在往 stdout 画界面
+    "dumpIntervalSecs": 30
+  },
+  "ltm": { "enabled": true, "maxResults": 5 },      // 注册 remember/recall 工具
+  "memory": { "persistence": true }                 // false = 本次运行不落任何历史
+}
+```
+
+`compactor.contextWindow` 仍然可读（兼容老配置），但不再推荐：
+`token.contextWindow` 是唯一来源，两者都写时以 `token` 为准。
+
+## 生产部署
+
+### 构建镜像
+
+```bash
+docker build -t code-agent-go:latest .
+```
+
+镜像基于 `distroless/static`（只有这一个二进制，没有 shell），因此：
+
+- **目录必须可写**：运行时状态全部落在 `HOME` 下（`~/.code-agent-go/`）。
+  会话 SQLite、长期记忆库、信任态文件都在那里，容器里务必给 `HOME` 挂可写卷或匿名卷。
+- **配置文件里的日志路径必须是相对路径**
+  （历史版本里有 `/Users/...` 的绝对路径，进容器后创建日志文件必然失败）。
+- **需要 TTY**：当前入口仍是交互式 TUI，无头模式（`--print`）尚未实现，
+  容器内请 `docker run -it --rm ...`。无头模式落地后应改为非交互入口。
+
+### 运行
+
+```bash
+docker run -it --rm \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -e OPENAI_BASE_URL="$OPENAI_BASE_URL" \
+  -v "$HOME/.code-agent-go:/home/nonroot/.code-agent-go" \
+  -v "$(pwd):/workspace" -w /workspace \
+  code-agent-go:latest -c /app/conf/config.json
+```
+
+### 可观测性
+
+`observability.enabled`（或 `--metrics`）打开后，进程按 `dumpIntervalSecs` 周期输出两类单行 JSON：
+
+```jsonc
+{"type":"metrics","snapshot":{"llm":{"calls":12,"errors":0,"success_rate":1,"avg_latency_ms":820},
+ "tool":{"calls":30,"errors":2,"success_rate":0.933,"by_tool":{"bash_tool":{"calls":11,"errors":2}}},
+ "token":{"input_tokens":51200,"output_tokens":4200,"total_tokens":55400},
+ "compaction":{"count":1,"tokens_saved":7100}}}
+{"type":"span","span":{"trace_id":"...","name":"llm.generate","duration_ms":812,"attrs":{"turn":"3"}}}
+```
+
+采集建议：
+
+- `metrics` 是累计快照（幂等，重复采集不失真），`span` 是一次性事件；
+- 告警可围绕 `tool.success_rate`、`llm.errors`、`token.total_tokens` 三个量做；
+- `token_window_high_water` 日志行表示上下文逼近窗口上限（见 `token.warnRatio`）。
+
+### 安全模型
+
+| 机制 | 位置 | 说明 |
+|------|------|------|
+| 高危命令识别 | `internal/hooks` | 9 条内置规则（`rm -rf`、force push、`DROP TABLE`…）+ 配置黑名单 |
+| 人工审批 | `internal/tools/approve.go` | 交互模式弹窗确认；非交互（无通道）默认拒绝 |
+| 信任态 | `internal/trust` | 三态持久化：undecided（默认，逐个问）/ trusted（放行）/ untrusted（每次都问，无通道则拒） |
+| 沙箱 | `internal/sandbox` | `sandbox.enabled` 时 bash 跑进一次性容器；缺 docker 直接报错而非回落宿主机 |
+
+信任态文件：`~/.code-agent-go/trust.json`。用 `--trust trusted` 落盘，用 `--approve` 只管本次进程。
+
+## 开发
+
+```bash
+make test         # 全量单测
+make build        # 产出 bin/code-agent-go
+make docker-build # 构建镜像
+make test-live    # 连接真实 LLM 的集成测试（需要 .env）
+```
+
+## 已知限制
+
+- **无头模式未实现**：`internal/tui` 是唯一入口，CI/管道场景暂不可用（`docs/production-roadmap-4weeks.md` 第 3 周 D13 遗留项）。
+- `--resume` / `--continue` 已下线，续跑只能用 `-s <session-id>` 手动指定会话。
+- `internal/ltm` 的检索是 SQLite `LIKE` 实现，尚未引入向量检索。

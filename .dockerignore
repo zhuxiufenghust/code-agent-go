@@ -1,0 +1,10 @@
+.env
+.git
+.github
+.gitignore
+bin/
+example
+logs/
+skills_example/
+docs/
+*_test.go

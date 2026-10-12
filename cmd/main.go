@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -13,12 +14,17 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/context_mng"
 	"github.com/zhuxiufenghust/code-agent-go/internal/engine"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
+	"github.com/zhuxiufenghust/code-agent-go/internal/ltm"
+	"github.com/zhuxiufenghust/code-agent-go/internal/observability"
 	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
+	"github.com/zhuxiufenghust/code-agent-go/internal/sandbox"
 	"github.com/zhuxiufenghust/code-agent-go/internal/skill"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
+	"github.com/zhuxiufenghust/code-agent-go/internal/trust"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tui"
 
 	"path/filepath"
+	"time"
 
 	flag "github.com/spf13/pflag"
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
@@ -91,12 +97,29 @@ func main() {
 	// LLM 配置必须在"发第一个请求之前"校验：BaseURL/Key 缺失会让 openai-go
 	// 构造出空 host 的请求，报错是 `unsupported protocol scheme ""`，
 	// 既不提 BaseURL 也不提环境变量名，排查成本极高。
-	if err := provider.ValidateConfig(cfg.OpenAI); err != nil {
+	modelCfg, err := cfg.Models.ResolveModel(cliOp.model)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("模型选择失败: %v", err)))
+		os.Exit(1)
+	}
+	if err := provider.ValidateModel(modelCfg); err != nil {
 		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("LLM 配置不可用: %v", err)))
 		os.Exit(1)
 	}
-	pr := provider.NewOpenAIProvider(cfg.OpenAI)
-	registry := registerTools(homeDir, workDir)
+	pr, err := provider.New(modelCfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("构造 Provider 失败: %v", err)))
+		os.Exit(1)
+	}
+	registry := registerTools(homeDir, workDir, cfg)
+	ltmStore := openLTM(homeDir, cfg, registry)
+	if ltmStore != nil {
+		defer ltmStore.Close()
+	}
+
+	// 观测组件：默认 nop（零开销），配置或 --metrics 打开后按周期导出 JSON 指标。
+	obs := buildObservability(cfg)
+	defer obs.Close()
 	// 审批默认开启：只有在配置里显式关闭（tool 段存在且 enableApproval=false）才停用。
 	// 内置高危规则（internal/hooks）保证即使不配 dangerCmds 也有底线，
 	// 所以"配置缺失"应当等价于"保持防护"，而不是"关闭防护"。
@@ -107,9 +130,10 @@ func main() {
 		if cfg.Tool != nil {
 			dangerCmds = cfg.Tool.DangerCmds
 		}
-		approvalMgr = tools.NewApprovalManager(dangerCmds)
+		approvalMgr = tools.NewApprovalManager(dangerCmds, trustOpts(homeDir)...)
 		registry.Use(approvalMgr.WaitForApproval)
-		log.Info("工具审批已启用（内置高危规则 + 配置黑名单）", zap.Strings("danger_cmds", dangerCmds))
+		log.Info("工具审批已启用（内置高危规则 + 配置黑名单）", zap.Strings("danger_cmds", dangerCmds),
+			zap.String("trust_level", approvalMgr.TrustLevel().String()))
 	} else {
 		log.Warn("工具审批已被显式关闭：高危命令将直接执行")
 	}
@@ -120,19 +144,28 @@ func main() {
 		sessID = uuid.New().String()
 	}
 
-	agent := engine.NewAgentEngine(pr, registry, engine.WithWorkDir(workDir),
+	engineOpts := []engine.Option{
+		engine.WithWorkDir(workDir),
 		engine.WithHomeDir(homeDir),
 		engine.WithSessionID(sessID), engine.WithMaxLoopTurns(cfg.Engine.MaxLoopTurns),
 		engine.WithRunTimeout(cfg.Engine.RunTimeout),
 		// 压缩配置由 ApplyDefaults 补齐，这里无条件装配（缺配置不再等于关闭压缩）。
 		engine.WithCompactor(buildCompactor(cfg, pr)),
-	)
+		engine.WithObservability(obs),
+		// 上下文窗口与告警水位：token 段是单一来源，ApplyDefaults 已与 compactor 对齐。
+		engine.WithTokenBudget(cfg.Token.ContextWindow, cfg.Token.WarnRatio),
+	}
+	if !cfg.Memory.PersistenceEnabled() {
+		engineOpts = append(engineOpts, engine.WithDisablePersistence())
+		log.Info("会话持久化已被显式关闭：本次运行不落库任何历史")
+	}
+	agent := engine.NewAgentEngine(pr, registry, engineOpts...)
 
 	if approvalMgr != nil {
 		approvalMgr.SetEmitGetter(agent)
 	}
 
-	p := tea.NewProgram(tui.New(workDir, cfg.OpenAI.Model, agent),
+	p := tea.NewProgram(tui.New(workDir, modelCfg.Model, agent),
 		tea.WithAltScreen(),
 		// 启用鼠标(含滚轮)捕获：滚轮事件会作为 tea.MouseWheelMsg 交给程序，
 		// 由 viewport 在应用内滚动，而不是让终端去滚自己的滚动历史（从而看不到启动前输出）。
@@ -188,7 +221,7 @@ func normalizeConfig() *config.Config {
 // buildCompactor 按配置装配压缩器。
 // 关键点：token 窗口与消息条数是两种不同单位，不能混用——
 // sliding 策略吃的是"消息条数"，token/summarization 吃的是"token 窗口"。
-func buildCompactor(cfg *config.Config, pr *provider.OpenAIProvider) context_mng.Compactor {
+func buildCompactor(cfg *config.Config, pr provider.LLMProvider) context_mng.Compactor {
 	c := cfg.Compactor
 	switch c.Strategy {
 	case config.CompactorStrategySliding:
@@ -203,6 +236,82 @@ func buildCompactor(cfg *config.Config, pr *provider.OpenAIProvider) context_mng
 	}
 }
 
+// buildObservability 按配置选择观测实现。
+// 默认返回 nop：观测不是"越多越好"，在没有采集侧的环境里往 stderr 灌 JSON
+// 只会淹没真正有用的错误日志，因此它是一个显式开关。
+func buildObservability(cfg *config.Config) observability.Observability {
+	o := cfg.Observability
+	enabled := o != nil && (o.Enabled || cliOp.metrics)
+	if !enabled {
+		return observability.Nop()
+	}
+	exporter := o.Exporter
+	var w io.Writer = os.Stderr
+	if exporter == config.ExporterStdout {
+		w = os.Stdout
+	}
+	interval := time.Duration(o.DumpIntervalSecs) * time.Second
+	log.Info("观测指标导出已启用", zap.String("exporter", exporter), zap.Duration("interval", interval))
+	return observability.NewStdout(w, interval)
+}
+
+// openLTM 打开长期记忆库并在启用时把 remember/recall 注册进工具表。
+// 返回 nil 表示未启用（调用方据此跳过 Close）。
+func openLTM(homeDir string, cfg *config.Config, registry tools.Registry) ltm.Store {
+	if cfg.LTM == nil || !cfg.LTM.Enabled {
+		return nil
+	}
+	store, err := ltm.NewSQLiteStore(homeDir)
+	if err != nil {
+		// LTM 属于增强能力：起不来只降级，不能挡住主流程启动。
+		log.Error("长期记忆初始化失败，已跳过", zap.Error(err))
+		return nil
+	}
+	for _, tool := range []tools.Tool{
+		tools.NewRememberTool(store),
+		tools.NewRecallTool(store, cfg.LTM.MaxResults),
+	} {
+		if err := registry.Register(tool); err != nil {
+			log.Warn("注册长期记忆工具失败", zap.String("tool", tool.GetDefinition().Name), zap.Error(err))
+			continue
+		}
+		log.Info("已注册长期记忆工具", zap.String("tool", tool.GetDefinition().Name))
+	}
+	return store
+}
+
+// trustOpts 决定本次进程的信任态。
+//
+// 优先级：--trust > 持久化的信任态 > Undecided；--approve 只是"本次放行"，不写盘。
+// 显式写盘的选择必须留下理由，否则下次启动看到"已授权"却不知道是谁授权的。
+func trustOpts(homeDir string) []func(*tools.ApprovalManager) {
+	store := trust.NewStore(homeDir)
+	opts := []func(*tools.ApprovalManager){tools.WithTrustStore(store)}
+
+	level := store.Load().Level
+	switch {
+	case cliOp.trustLevel != "":
+		parsed, err := trust.ParseLevel(cliOp.trustLevel)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("--trust 参数非法: %v", err)))
+			os.Exit(1)
+		}
+		state := trust.State{Level: parsed, Reason: "cli --trust"}
+		if err := store.Save(state); err != nil {
+			fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("持久化信任态失败: %v", err)))
+			os.Exit(1)
+		}
+		level = parsed
+	case cliOp.approve:
+		level = trust.Trusted
+	}
+	if level == trust.Trusted {
+		log.Warn("当前会话信任态为 trusted：高危命令将不再逐个确认",
+			zap.Bool("session_only", cliOp.trustLevel == ""))
+	}
+	return append(opts, tools.WithTrustLevel(level))
+}
+
 func parseFlags(homeDir string, workDir string) {
 	cliOp.homeDir = homeDir
 	cliOp.workDir = workDir
@@ -213,6 +322,10 @@ func parseFlags(homeDir string, workDir string) {
 	flag.BoolVarP(&enableTools, "enable-tools", "e", false, "Enable tools")
 	flag.StringVarP(&cliOp.sessionID, "session-id", "s", "", "Session ID")
 	flag.BoolVarP(&showVersion, "version", "v", false, "Show version information")
+	flag.BoolVarP(&cliOp.approve, "approve", "y", false, "本次会话放行高危命令（不写盘的临时 trusted）")
+	flag.StringVar(&cliOp.trustLevel, "trust", "", "设置并持久化信任态：trusted|untrusted|undecided")
+	flag.BoolVar(&cliOp.metrics, "metrics", false, "导出指标快照与调用 Span（单行 JSON，默认 stderr）")
+	flag.StringVarP(&cliOp.model, "model", "m", "", "使用的模型名（对应 models.items[].name，缺省取 models.default）")
 	flag.Parse()
 
 	if configPath != "" {
@@ -222,13 +335,26 @@ func parseFlags(homeDir string, workDir string) {
 	cliOp.showVersion = showVersion
 }
 
-func registerTools(homeDir, workDir string) tools.Registry {
+func registerTools(homeDir, workDir string, cfg *config.Config) tools.Registry {
 	register := tools.NewRegistry()
+	// 沙箱开启时把 bash 的执行体换成一次性容器；关闭时就是宿主机直跑（Local）。
+	bashOpts := []tools.BashOption{}
+	if cfg.Sandbox != nil && cfg.Sandbox.Enabled {
+		bashOpts = append(bashOpts, tools.WithRunner(sandbox.Docker{
+			Image:           cfg.Sandbox.Image,
+			NetworkDisabled: cfg.Sandbox.NetworkDisabled,
+			ReadOnlyRootfs:  cfg.Sandbox.ReadOnlyRootfs,
+			Timeout:         time.Duration(cfg.Sandbox.TimeoutSecs) * time.Second,
+		}))
+		log.Info("bash 沙箱已启用", zap.String("image", cfg.Sandbox.Image),
+			zap.Bool("network_disabled", cfg.Sandbox.NetworkDisabled),
+			zap.Bool("read_only_rootfs", cfg.Sandbox.ReadOnlyRootfs))
+	}
 	tools := []tools.Tool{
 		tools.NewEditTool(workDir),
 		tools.NewReadTool(workDir),
 		tools.NewWriteTool(workDir),
-		tools.NewBashTool(workDir),
+		tools.NewBashTool(workDir, bashOpts...),
 		tools.NewWebSearchTool(),
 		skill.NewSkillDispatcher(skill.NewSkillLoader(homeDir, workDir)),
 	}
