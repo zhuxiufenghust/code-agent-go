@@ -10,6 +10,7 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/base"
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
+	"github.com/zhuxiufenghust/code-agent-go/internal/observability"
 	"github.com/zhuxiufenghust/code-agent-go/internal/report"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
 )
@@ -84,6 +85,8 @@ func (e *AgentEngine) StreamRun(ctx context.Context, userPrompt string) (<-chan 
 	// 整轮运行的总时长上限。人工审批等待由 pauser 暂停计时，不计入该配额。
 	// 必须在 emitter 之前创建：emitter 的审批回调需要它来暂停/恢复计时。
 	processCtx, pauser, cancelProcess := newPausableTimeout(ctx, e.runTimeoutOrDefault())
+	// 根 Span：一次流式运行 = 一棵调用树，下面每轮 LLM / 每次工具都是它的子孙。
+	runCtx, rootSpan := e.obs.StartSpan(processCtx, observability.SpanRun)
 	em := report.Emitter{
 		Generate: func(ctx context.Context, turn int, history []schema.Message, tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 			return e.streamGenerate(ctx, ch, turn, history, tools)
@@ -124,13 +127,15 @@ func (e *AgentEngine) StreamRun(ctx context.Context, userPrompt string) (<-chan 
 		},
 	}
 
-	e.UpdateEmitter(em)
+	// 与 Run 一致：观测埋点织在回调层，所有 LLM/工具调用自动被统计。
+	e.UpdateEmitter(observability.Instrument(processCtx, em, e.obs))
 
 	base.GoWrap(func() {
 		defer close(ch)
 		defer cancelProcess()
+		defer rootSpan.End(nil)
 
-		if err := e.runLoop(processCtx, userPrompt, "agent-stream"); err != nil {
+		if err := e.runLoop(runCtx, userPrompt, "agent-stream"); err != nil {
 			// 不能裸发送：ch 无缓冲，客户端停读（审批弹窗模态/异常中断）时
 			// 会永久阻塞，defer close(ch) 无法执行，TUI 表现为假死。
 			// processCtx 此刻往往已超时/取消，因此用脱离其取消链路、
