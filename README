@@ -175,10 +175,13 @@ make test         # 全量单测
 make build        # 产出 bin/code-agent-go
 make docker-build # 构建镜像
 make test-live    # 连接真实 LLM 的集成测试（需要 .env）
+make smoke-headless  # 无头模式端到端冒烟（不需要 Key/网络，靠 scripts/fake_openai.py 假模型，需 python3）
 ```
+
+`make smoke-headless` 覆盖：位置参数、管道输入、`--output json`、高危命令默认拒绝、
+`-y` 放行、缺输入提示、终止信号退出码 130。端口冲突时用 `PORT=8124 make smoke-headless`。
 
 ## 已知限制
 
-- **无头模式未实现**：`internal/tui` 是唯一入口，CI/管道场景暂不可用（`docs/production-roadmap-4weeks.md` 第 3 周 D13 遗留项）。
 - `--resume` / `--continue` 已下线，续跑只能用 `-s <session-id>` 手动指定会话。
 - `internal/ltm` 的检索是 SQLite `LIKE` 实现，尚未引入向量检索。
