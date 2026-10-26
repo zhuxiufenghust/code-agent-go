@@ -187,7 +187,7 @@
 |---|---|---|
 | D6 token 计量取代 panic | ✅ | `report.Emitter.TokenUpdate`、`AgentEngine.usage`、`EventUsage`；测试 `usage_test.go` |
 | D7 上下文压缩（摘要 + 令牌兜底 + 孤立工具对修复） | ✅ | `internal/context_mng/`（sliding/token/summarization）；测试 `compaction_test.go`、`summarization_compactor_test.go` |
-| D8~D9 会话续跑 | 🟡 | 持久化增量落库已完整（`SaveHistoryContext` + `persistence_test.go`）；但 `LoadHistoryContext` 的 TODO 未清、`--resume/--continue` 已下线，只能 `-s <session-id>` 手动续跑 |
+| D8~D9 会话续跑 | 🟡 | **续跑本体可用**：同一 `-s <id>` 二次运行实测 `history_msg_count=5 / start_index=5`（历史被还原且增量落库），`SaveHistoryContext` + `persistence_test.go` 完整；仍缺 `--resume/--continue` 便捷入口，`LoadHistoryContext` 里的 TODO 注释已过时（实现就在下面），缺"历史还原"专项用例 |
 
 ### 第 3 周：技能、流式与无头模式
 
@@ -220,7 +220,7 @@
 |---|---|
 | 一次长跑可输出 token/耗时/工具成功率指标 | ✅ `observability.enabled` 或 `--metrics` 打开即可（详见 README"可观测性"） |
 | 信任态在重启后保持 | ✅ `--trust trusted` 落盘后跨进程生效；`--approve` 仅限本次进程 |
-| `docker build` 可出镜像，README 含生产部署说明 | ✅ `make docker-build`；注意容器内仍需 TTY（无头模式属 W3 遗留） |
+| `docker build` 可出镜像，README 含生产部署说明 | ✅ `make docker-build`；容器内交互用 `-it`，流水线直接 `-p` 即可（不再需要 TTY） |
 
 ### W4 复核补记（本机实测，非静态审查）
 
@@ -241,8 +241,11 @@
    → 已修复，见下方"W3 遗留补齐：无头模式（D13）"。
 2. ~~**该退出路径丢最后一帧指标**：提前 `os.Exit` 使 `defer obs.Close()` 不执行~~
    → 已修复：`main` 改为 `os.Exit(run())`，退出码冒泡，`defer` 全部按序执行。
-3. D8 `LoadHistoryContext` TODO 仍在（`internal/engine/agent_loop.go`），`--resume/--continue` 缺位，
-   续跑只能 `-s <session-id>` 手工指定。
+3. **D8 `--resume` / `--continue` 便捷入口缺位**：`LoadHistoryContext` 里的 TODO 注释已过时
+   （下面就是实现），续跑本体经 `-s <session-id>` 实测可用；差的只是"一键续上次"的入口
+   与一条历史还原用例。
+4. **差距分析表里的"Sub-Agent 委派"（P2）在 4 周计划里没有任何对应 D 条目**：属未开工且未排期，
+   `internal/engine/stream.go:71` 还留着指向不存在类型的 `EventSubAgent` 注释。
 
 ### W3 遗留补齐：无头模式（D13）
 
@@ -265,6 +268,19 @@ W4 收尾时补上了这条原来标红的项，并入 `week_seven`：
 - 高危 `rm -rf`：`高危命令被拒=1`、目标目录**仍在**；加 `-y` 后同一条命令真的执行（控制变量对照）；
 - 运行中 SIGINT：退出码 `130`，并且退出前仍然导出最后一帧 `{"type":"metrics"}`；
 - 缺输入：打印使用提示并退出 `1`。
+
+上述场景已固化为 `make smoke-headless`（`scripts/fake_openai.py` + `scripts/smoke_headless.sh`），
+7 组断言全绿，不需要 Key / 网络，可直接进 CI。
+
+### 全表复核结论（最新一轮）
+
+逐项对照代码与实测，除以下三条外均已落地：
+
+| 缺口 | 现状 |
+|---|---|
+| `--resume` / `--continue` 入口 | 未做；`-s <session-id>` 等价能力已实测可用 |
+| Anthropic Provider 实现 | 未做；`provider.Register/New` 工厂已就位，只有 OpenAI 兼容实现 |
+| Sub-Agent 委派 | 完全未开工，且未进本计划条目（`stream.go:71` 留有一条指向不存在类型的注释） |
 
 ---
 
