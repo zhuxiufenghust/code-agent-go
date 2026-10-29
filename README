@@ -181,7 +181,13 @@ make smoke-headless  # 无头模式端到端冒烟（不需要 Key/网络，靠 
 `make smoke-headless` 覆盖：位置参数、管道输入、`--output json`、高危命令默认拒绝、
 `-y` 放行、缺输入提示、终止信号退出码 130。端口冲突时用 `PORT=8124 make smoke-headless`。
 
+## Sub-Agent 委派
+
+`subagent.enabled: true` 后模型会多出 `delegate_tool`：把彼此独立的子任务并行派给子 Agent，
+子 Agent 跑在独立上下文里，只回传结构化结论（默认 `maxDepth=1`，即子 Agent 不能再委派）。
+详见 `docs/features-and-usage.md` 第 3 节。
+
 ## 已知限制
 
-- `--resume` / `--continue` 已下线，续跑只能用 `-s <session-id>` 手动指定会话。
+
 - `internal/ltm` 的检索是 SQLite `LIKE` 实现，尚未引入向量检索。

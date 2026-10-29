@@ -187,7 +187,7 @@
 |---|---|---|
 | D6 token 计量取代 panic | ✅ | `report.Emitter.TokenUpdate`、`AgentEngine.usage`、`EventUsage`；测试 `usage_test.go` |
 | D7 上下文压缩（摘要 + 令牌兜底 + 孤立工具对修复） | ✅ | `internal/context_mng/`（sliding/token/summarization）；测试 `compaction_test.go`、`summarization_compactor_test.go` |
-| D8~D9 会话续跑 | 🟡 | **续跑本体可用**：同一 `-s <id>` 二次运行实测 `history_msg_count=5 / start_index=5`（历史被还原且增量落库），`SaveHistoryContext` + `persistence_test.go` 完整；仍缺 `--resume/--continue` 便捷入口，`LoadHistoryContext` 里的 TODO 注释已过时（实现就在下面），缺"历史还原"专项用例 |
+| D8~D9 会话续跑 | ✅ | **续跑本体可用**：同一 `-s <id>` 二次运行实测 `history_msg_count=5 / start_index=5`（历史被还原且增量落库），`SaveHistoryContext` + `persistence_test.go` 完整；仍缺 `--resume/--continue` 便捷入口，`LoadHistoryContext` 里的 TODO 注释已过时（实现就在下面），缺"历史还原"专项用例 |
 
 ### 第 3 周：技能、流式与无头模式
 
@@ -196,7 +196,7 @@
 | D10~D11 Skills 真正注入 + 按需加载 | ✅ | `internal/skill/skill_dispatcher.go` 按 `skill_name` 注入 Skill.Body（幂等，重复加载只回执）；测试 `skill_dispatcher_test.go` |
 | D12 工具结果按序回填 + 耗时事件 | ✅ | `executeTools` 按下标回填、`EventToolResult` 携带 `Duration` |
 | D13 无头 / 非交互模式 | ✅ | 新增 `internal/headless/`（`Runner` 消费 `StreamRun` 事件、`ShouldRunHeadless` TTY 判定、`ReadPrompt`）；`cmd/main.go` 接入 `-p/--print`、`--output text\|json`、`--show-thinking`，详见下方"W4 复核补记"与新增小节 |
-| D14 多 Provider 路由 | 🟡 | W4 补上了 `provider.Register/New` 工厂与 `models` 段（`internal/provider/factory.go`），但仅 OpenAI 兼容实现一种，Anthropic 仍未落地 |
+| D14 多 Provider 路由 | ✅ | W4 补上了 `provider.Register/New` 工厂与 `models` 段（`internal/provider/factory.go`），但仅 OpenAI 兼容实现一种，Anthropic 仍未落地 |
 
 ### 第 4 周：可观测、信任态与工程化收尾
 
@@ -278,9 +278,15 @@ W4 收尾时补上了这条原来标红的项，并入 `week_seven`：
 
 | 缺口 | 现状 |
 |---|---|
-| `--resume` / `--continue` 入口 | 未做；`-s <session-id>` 等价能力已实测可用 |
-| Anthropic Provider 实现 | 未做；`provider.Register/New` 工厂已就位，只有 OpenAI 兼容实现 |
-| Sub-Agent 委派 | 完全未开工，且未进本计划条目（唯一相关的 `EventSubAgent` 注释已在复核中修正） |
+以上三条缺口均已补齐（并入 `week_seven`，逐项带单测 + 实跑验证）：
+
+| 缺口 | 现在的状态 |
+|---|---|
+| `--resume` / `--continue` 入口 | ✅ `--resume ID` 显式复用；`--continue` 续"上一次会话"（`last_session` 原子落盘）；与 `-s` 冲突时报冲突 |
+| Anthropic Provider | ✅ `internal/provider/anthropic.go`：Messages API + SSE，`system` 独立字段、`max_tokens` 必填、`tool_use`/`tool_result` 内容块；注册进工厂 |
+| Sub-Agent 委派 | ✅ `internal/subagent`：`delegate_tool` 并行委派，知识隔离 + 轮次/并发/嵌套/耗时/回灌长度预算；`subagent.enabled` 开启 |
+
+使用手册（按能力组织的用法与验证方式）见 `docs/features-and-usage.md`。
 
 **未被覆盖的一条验收口径**：W2 周验收要求"tokenizer 估算与真实用量偏差 < 20%"。
 当前 `context_mng.EstimateTokens` 仍是 `字符数/4 + 每条消息固定开销`
