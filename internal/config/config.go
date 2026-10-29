@@ -36,13 +36,14 @@ type OpenAIConfig struct {
 
 // Config is the configuration for the application.
 type Config struct {
-	Log           *LogConfig           `json:"log"`           // 日志相关配置
-	OpenAI        *OpenAIConfig        `json:"openai"`        // OpenAI 相关配置
-	Engine        *EngineConfig        `json:"engine"`        // AgentEngine 相关配置
-	LTM           *LtmConfig           `json:"ltm"`           // LTM 相关配置
-	Memory        *MemoryConfig        `json:"memory"`        // Memory 相关配置
-	Skill         *SkillConfig         `json:"skill"`         // Skill 相关配置
-	Tool          *ToolConfig          `json:"tool"`          // Tool 相关配置
+	Log           *LogConfig           `json:"log"`    // 日志相关配置
+	OpenAI        *OpenAIConfig        `json:"openai"` // OpenAI 相关配置
+	Engine        *EngineConfig        `json:"engine"` // AgentEngine 相关配置
+	LTM           *LtmConfig           `json:"ltm"`    // LTM 相关配置
+	Memory        *MemoryConfig        `json:"memory"` // Memory 相关配置
+	Skill         *SkillConfig         `json:"skill"`  // Skill 相关配置
+	Tool          *ToolConfig          `json:"tool"`
+	Subagent      *SubagentConfig      `json:"subagent"`      // Tool 相关配置
 	Compactor     *CompactorConfig     `json:"compactor"`     // Compactor 相关配置
 	Models        *ModelsConfig        `json:"models"`        // 可选模型清单（多 Provider 路由）
 	Observability *ObservabilityConfig `json:"observability"` // 指标/埋点导出配置
@@ -98,6 +99,9 @@ type ModelConfig struct {
 	ApiKeyEnv        string `json:"apiKeyEnv" yaml:"apiKeyEnv"`
 	IncludeReasoning bool   `json:"includeReasoning" yaml:"includeReasoning"`
 	MaxRetries       int    `json:"maxRetries" yaml:"maxRetries"`
+	// MaxTokens 限制单次响应长度。OpenAI 兼容侧可省略（由服务端决定），
+	// Anthropic Messages API 必填，缺省走 DefaultAnthropicMaxTokens。
+	MaxTokens int `json:"maxTokens" yaml:"maxTokens"`
 }
 
 // ModelsConfig 是模型清单：Default 指定缺省模型名（为空时取列表第一项）。
@@ -198,6 +202,31 @@ const (
 // ApplyDefaults 为未配置的项补上生产可用的默认值，避免"配置缺一段"就等于"保护关闭"。
 // 目前负责：engine 段缺失时补空结构、maxLoopTurns 缺省时补 DefaultMaxLoopTurns。
 func (c *Config) ApplyDefaults() {
+	// Subagent 默认关闭：委派会额外起子 Agent，必须由配置显式授权开启。
+	if c.Subagent == nil {
+		c.Subagent = &SubagentConfig{Enabled: false}
+	}
+	if s := c.Subagent; s != nil {
+		if s.MaxDepth <= 0 {
+			s.MaxDepth = 1
+		}
+		if s.MaxConcurrent <= 0 {
+			s.MaxConcurrent = 3
+		}
+		if s.MaxTurns <= 0 {
+			s.MaxTurns = 8
+		}
+		if s.MaxOutputChars <= 0 {
+			s.MaxOutputChars = 8000
+		}
+		if s.TimeoutSecs <= 0 {
+			s.TimeoutSecs = 180
+		}
+		if s.ExcludeTools == nil {
+			// 默认只给子 Agent 读类工具：写操作仍由主 Agent 亲自执行，避免并发写冲突。
+			s.ExcludeTools = []string{"write_tool", "edit_tool"}
+		}
+	}
 	if c.Engine == nil {
 		c.Engine = &EngineConfig{}
 	}
@@ -339,6 +368,40 @@ func (m ModelConfig) ToOpenAIConfig() *OpenAIConfig {
 	}
 }
 
+// ToAnthropicConfig 从模型清单派生 Anthropic Messages API 配置。
+//
+// BaseURLEnv/ApiKeyEnv 沿用 OpenAI 段的语义（环境变量名而非明文），
+// 这样"凭证不进配置文件"这条约束对所有 Provider 一致。
+func (m ModelConfig) ToAnthropicConfig() *AnthropicConfig {
+	return &AnthropicConfig{
+		Model:            m.Model,
+		BaseURLEnv:       m.BaseURLEnv,
+		ApiKeyEnv:        m.ApiKeyEnv,
+		IncludeReasoning: m.IncludeReasoning,
+		MaxTokens:        m.MaxTokens,
+		MaxRetries:       m.MaxRetries,
+	}
+}
+
+// DefaultAnthropicMaxTokens 是 Anthropic 未配置 max_tokens 时的缺省值。
+// Messages API 把 max_tokens 作为必填字段（与 OpenAI 不同），
+// 缺省值必须显式存在，否则每次请求都会以 400 失败。
+const DefaultAnthropicMaxTokens = 8192
+
+// DefaultAnthropicThinkingBudget 是开启 thinking 时的 token 预算缺省值。
+const DefaultAnthropicThinkingBudget = 2048
+
+// AnthropicConfig 是 Anthropic Messages API 的配置。
+type AnthropicConfig struct {
+	Model            string `json:"model" yaml:"model"`
+	BaseURLEnv       string `json:"baseURLEnv" yaml:"baseURLEnv"`
+	ApiKeyEnv        string `json:"apiKeyEnv" yaml:"apiKeyEnv"`
+	IncludeReasoning bool   `json:"includeReasoning" yaml:"includeReasoning"`
+	// MaxTokens 是单次响应的最大 token 数（Messages API 必填）。
+	MaxTokens  int `json:"maxTokens" yaml:"maxTokens"`
+	MaxRetries int `json:"maxRetries" yaml:"maxRetries"`
+}
+
 // InferProvider 由模型名前缀推断所属 Provider；
 // 推断不出时按 OpenAI 兼容处理（绝大多数网关/本地服务都走这条）。
 func InferProvider(model string) string {
@@ -350,6 +413,23 @@ func InferProvider(model string) string {
 	default:
 		return ProviderOpenAI
 	}
+}
+
+type SubagentConfig struct {
+	// Enabled 打开委派工具（默认关闭：子 Agent 会额外消耗 token，应显式开启）。
+	Enabled bool `json:"enabled"`
+	// MaxDepth 允许的委派层数；1 表示子 Agent 不能再委派。
+	MaxDepth int `json:"maxDepth"`
+	// MaxConcurrent 同时运行的子 Agent 上限。
+	MaxConcurrent int `json:"maxConcurrent"`
+	// MaxTurns 单个子任务的轮次上限。
+	MaxTurns int `json:"maxTurns"`
+	// MaxOutputChars 结论回灌主上下文的字符上限。
+	MaxOutputChars int `json:"maxOutputChars"`
+	// TimeoutSecs 单个子任务的墙钟上限（秒）。
+	TimeoutSecs int `json:"timeoutSecs"`
+	// ExcludeTools 不希望子 Agent 看到的工具（如 write_tool/edit_tool）。
+	ExcludeTools []string `json:"excludeTools"`
 }
 
 type ToolConfig struct {

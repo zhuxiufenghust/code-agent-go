@@ -18,17 +18,22 @@ func TestNewRoutesByExplicitProvider(t *testing.T) {
 }
 
 // TestNewInfersProviderFromModel 验证未写 provider 时按模型前缀推断，
-// 推断结果落在已注册表里（anthropic 尚未实现，因此会报错而不是悄悄当 openai 发请求）。
+// 推断结果必须落在已注册表里：claude-/anthropic- 前缀走 Anthropic Messages API，
+// 未注册的 provider 必须报错而不是静默回落到 OpenAI 兼容实现。
 func TestNewInfersProviderFromModel(t *testing.T) {
 	if _, err := New(config.ModelConfig{Model: "ollama-llama3"}); err != nil {
 		t.Fatalf("前缀推断失败: %v", err)
 	}
-	_, err := New(config.ModelConfig{Model: "claude-3-5-sonnet"})
-	if err == nil {
-		t.Fatal("未实现的 provider 必须报错，不能静默回落到 OpenAI 兼容实现")
+	pr, err := New(config.ModelConfig{Model: "claude-3-5-sonnet", BaseURLEnv: "ANTHROPIC_BASE_URL_TEST", ApiKeyEnv: "ANTHROPIC_API_KEY_TEST"})
+	if err != nil {
+		t.Fatalf("claude 前缀应路由到已实现的 anthropic: %v", err)
 	}
-	if !strings.Contains(err.Error(), "暂不支持的 provider") {
-		t.Fatalf("错误信息应指出 provider 不受支持, 实际 %v", err)
+	if _, ok := pr.(*AnthropicProvider); !ok {
+		t.Fatalf("claude 前缀应构造 AnthropicProvider, 实际 %T", pr)
+	}
+	_, err = New(config.ModelConfig{Provider: "not-exist", Model: "whatever"})
+	if err == nil || !strings.Contains(err.Error(), "暂不支持的 provider") {
+		t.Fatalf("未注册的 provider 必须报错并列出已注册项, 实际 %v", err)
 	}
 }
 

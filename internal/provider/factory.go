@@ -23,11 +23,17 @@ func init() {
 	openAIFactory := func(cfg config.ModelConfig) (LLMProvider, error) {
 		return NewOpenAIProvider(cfg.ToOpenAIConfig()), nil
 	}
+	anthropicFactory := func(cfg config.ModelConfig) (LLMProvider, error) {
+		return NewAnthropicProvider(cfg.ToAnthropicConfig()), nil
+	}
 	// OpenAI 兼容层是目前唯一的实现：自建网关、大部分云厂商、
 	// 以及 ollama 的 /v1 端点都走这条路径。
 	Register(config.ProviderOpenAI, openAIFactory)
 	Register(config.ProviderCompatible, openAIFactory)
 	Register(config.ProviderOllama, openAIFactory)
+	// Anthropic 用的是 Messages API（不是 /chat/completions），
+	// 必须先注册实现，否则 claude- 前缀的模型会被路由到 OpenAI 兼容层而 404。
+	Register(config.ProviderAnthropic, anthropicFactory)
 }
 
 // Register 注册（或覆盖）一个 provider 实现。
