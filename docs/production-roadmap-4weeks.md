@@ -244,8 +244,8 @@
 3. **D8 `--resume` / `--continue` 便捷入口缺位**：`LoadHistoryContext` 里的 TODO 注释已过时
    （下面就是实现），续跑本体经 `-s <session-id>` 实测可用；差的只是"一键续上次"的入口
    与一条历史还原用例。
-4. **差距分析表里的"Sub-Agent 委派"（P2）在 4 周计划里没有任何对应 D 条目**：属未开工且未排期，
-   `internal/engine/stream.go:71` 还留着指向不存在类型的 `EventSubAgent` 注释。
+4. **差距分析表里的"Sub-Agent 委派"（P2）在 4 周计划里没有任何对应 D 条目**：属未开工且未排期
+   （原先 `internal/engine/stream.go` 里那条指向不存在类型的 `EventSubAgent` 注释已在本次复核中修正）。
 
 ### W3 遗留补齐：无头模式（D13）
 
@@ -280,7 +280,12 @@ W4 收尾时补上了这条原来标红的项，并入 `week_seven`：
 |---|---|
 | `--resume` / `--continue` 入口 | 未做；`-s <session-id>` 等价能力已实测可用 |
 | Anthropic Provider 实现 | 未做；`provider.Register/New` 工厂已就位，只有 OpenAI 兼容实现 |
-| Sub-Agent 委派 | 完全未开工，且未进本计划条目（`stream.go:71` 留有一条指向不存在类型的注释） |
+| Sub-Agent 委派 | 完全未开工，且未进本计划条目（唯一相关的 `EventSubAgent` 注释已在复核中修正） |
+
+**未被覆盖的一条验收口径**：W2 周验收要求"tokenizer 估算与真实用量偏差 < 20%"。
+当前 `context_mng.EstimateTokens` 仍是 `字符数/4 + 每条消息固定开销`
+（`compact.go:15/44`）的近似，没有量化过偏差，属已知近似而非实测达标；
+需要精确控制成本时应接入真实 tokenizer（见"四、风险与依赖"第 2 条）。
 
 ---
 
