@@ -1,193 +1,226 @@
 # code-agent-go
 
-用 Go 实现的终端侧编码 Agent：LLM 返回 tool_calls → 解析 → 执行工具 → 结果回灌，循环直到收敛。
+用 Go 实现的终端侧编码 Agent：**LLM 返回 tool_calls → 解析 → 并发执行工具 → 结果回灌 → 循环直到收敛**。
+既可以当交互式 TUI 用，也可以像 `grep` 一样塞进管道（`code-agent-go -p "任务" > answer.md`）。
 
-- 状态：可本地开发使用。**生产可用化的进度见 `docs/production-roadmap-4weeks.md` 末尾的"进度回填"小节。**
-- 目录约定：`~/` 下的所有运行时状态都在 `~/.code-agent-go/`（会话库、长期记忆、信任态）。
+- 目录约定：所有运行时状态都在 `~/.code-agent-go/`（会话库 `data/sessions.db`、长期记忆 `data/`、信任态 `trust.json`、最近会话 `last_session`）。
+- 详细能力清单与使用手册：`docs/features-and-usage.md`；生产化进度与差距分析：`docs/production-roadmap-4weeks.md`。
 
-## 快速开始
+---
+
+## 1. 安装
+
+### 1.1 源码构建（Go 1.26+）
 
 ```bash
-# 1. 准备凭证（也可以直接配 --config 指向的配置文件）
-cp .env.example .env   # 填入 OPENAI_API_KEY / OPENAI_BASE_URL
-
-# 2. 配置文件：默认读 ~/.code-agent-go/conf/config.json，也可用 -c 指定
-cp conf/config.json ~/.code-agent-go/conf/config.json
-
-# 3. 构建 & 运行
-make build
-./bin/code-agent-go -c ./conf/config.json
+git clone <repo> && cd code-agent-go
+make build          # 产出 bin/code-agent-go
+# 或：go build -o bin/code-agent-go ./cmd
 ```
 
-## 常用参数
+### 1.2 容器镜像
+
+```bash
+make docker-build   # 产出 code-agent-go:latest（distroless 静态二进制，非 root 运行，19MB）
+```
+
+### 1.3 配置凭证
+
+```bash
+cp .env.example .env    # 填入 OPENAI_API_KEY / OPENAI_BASE_URL（或自建网关地址）
+cp conf/config.json ~/.code-agent-go/conf/config.json   # 默认配置路径，也可用 -c 指定
+```
+
+凭证只通过**环境变量名**引用（`apiKeyEnv` / `baseURLEnv`），不写进配置文件。
+
+---
+
+## 2. 快速开始
+
+```bash
+# 交互（TUI）：输入任务，Enter 发送，Alt+Enter 换行
+./bin/code-agent-go -c conf/config.json
+
+# 无头（CI / 管道）：stdout 只有答案，诊断全在 stderr
+./bin/code-agent-go -c conf/config.json -p "给 utils.go 的 ParseSize 补单元测试" > answer.md
+
+# 机器可读
+./bin/code-agent-go -c conf/config.json -p "列出目录" --output json | jq 'select(.type=="result")'
+```
+
+容器：
+
+```bash
+docker run -it --rm -e OPENAI_API_KEY=... -e OPENAI_BASE_URL=... \
+  -v "$HOME/.code-agent-go:/home/nonroot/.code-agent-go" -v "$(pwd):/workspace" -w /workspace \
+  code-agent-go:latest -c /app/conf/config.json                     # 交互
+
+docker run --rm -e OPENAI_API_KEY=... code-agent-go:latest \
+  -c /app/conf/config.json -p "跑一遍 go test 并汇报失败用例"        # 无头，不需要 TTY
+```
+
+---
+
+## 3. 核心功能与实现逻辑
+
+### 3.1 主循环（Agent Loop）
+
+落点：`internal/engine/agent_loop.go`、`internal/engine/stream.go`
+
+1. `LoadHistoryContext` 组装上下文：system（每次重新拼装）+ 会话历史（SQLite）+ 本轮 user；
+2. `runLoop` 每轮把上下文与工具定义交给 Provider，拿到 `Message`（文本或 `tool_calls`）；
+3. 有 `tool_calls` 就**并发**执行（受 `maxConcurrentTools` 限制），按下标回填结果，保证顺序稳定；
+4. 工具结果以 `role=user + tool_call_id` 回灌；**工具失败不中断会话**，错误作为上下文让模型自愈；
+5. 直到模型不再调工具，或触发保护：**最大轮次** `maxLoopTurns`、`runTimeout`、连续重复调用检测（卡住判定）。
+
+流式与非流式同源：TUI 与无头模式消费的是同一条 `StreamRun` 事件流
+（`thinking_delta / action_delta / tool_start / tool_result / usage / compaction / approval_required / final / error / done`）。
+
+### 3.2 工具系统
+
+落点：`internal/tools`（registry + 各工具）、`internal/skill`
+
+- 统一 `Tool` 接口（定义 + Execute），注册表支持**中间件链**：`Use(...)` 挂载审批等横切逻辑；
+- 工具结果统一按 20KB 截断（技能正文有更高预算），并按**工具类型给出对应建议**
+  （read 用行号分段、bash 用 `head/grep`、web 缩小范围等），避免给模型无效提示；
+- 工具：`read/write/edit`、`bash`、`web_search`、`web_fetch`、`skill_dispatcher`，
+  开启后追加 `remember_tool`/`recall_tool`（LTM）与 `delegate_tool`（委派）。
+
+### 3.3 上下文工程
+
+落点：`internal/context_mng`
+
+- `token.contextWindow` 是唯一来源（压缩阈值与水位预警都取它）；
+- 每轮 LLM 调用前估算 token，接近 80% 打 `token_window_high_water` 日志（只是预警）；
+- 超预算时按策略压缩：`summarization`（LLM 摘要早期消息，失败回退 `token` 预算截断）、`token`、`sliding`；
+- 压缩会维护"工具调用—工具结果"配对，避免产生孤立 `tool_call` 破坏协议。
+
+### 3.4 安全：高危命令与信任态
+
+落点：`internal/hooks`、`internal/tools/approve.go`、`internal/trust`
+
+- 9 条内置高危规则（rm -rf、force push、`DROP TABLE`、fork 炸弹…）+ 配置黑名单 `tool.dangerCmds`；
+- 命中后：有交互通道就弹窗确认；**无通道（无头/CI）默认拒绝**并回灌模型自愈；
+- 信任态三态持久化：`undecided`（默认逐个问）/ `trusted`（放行）/ `untrusted`（每次都问，无通道则拒）。
+  `--trust LEVEL` 落盘，`-y/--approve` 仅本次进程生效。
+
+### 3.5 沙箱
+
+落点：`internal/sandbox`
+
+`sandbox.enabled: true` 时 bash 跑进一次性容器：只读/读写挂载、可选 `--network none`、
+不继承宿主环境变量；**缺 docker 直接报错**，不悄悄回落宿主机。
+
+### 3.6 可观测性
+
+落点：`internal/observability`
+
+- `Metrics`：累计 token、LLM/工具调用次数与成功率、耗时、压缩次数（含分工具明细）；
+- `Tracer`：一次运行是一棵 `agent.run → llm.generate / tool.<name>` 的调用树，同 `trace_id`；
+- 导出器：`Nop`（默认零开销）与 `NewStdout(w, interval)`（每行一个 JSON 对象，便于采集）。
+
+### 3.7 多 Provider 路由
+
+落点：`internal/provider/factory.go`、`openai.go`、`anthropic.go`
+
+- `models.items` 声明多模型，`--model` 选择；`provider` 缺省时按前缀推断（`claude-`/`anthropic-` → anthropic，`ollama-` → ollama，其余 → openai 兼容）；
+- OpenAI 兼容走 `/chat/completions`；Anthropic 走 Messages API（`system` 独立字段、`max_tokens` 必填、`tool_use`/`tool_result` 内容块、按 content_block 累加工具入参）；
+- 未注册实现直接报错并列出已注册项，不静默回落。
+
+### 3.8 无头模式
+
+落点：`internal/headless`
+
+非 TTY、`-p/--print`、或 stdout 被重定向即进入无头：消费同一条事件流，
+`text` 模式 stdout 只放助手正文（诊断走 stderr），`json` 模式全部为单行 JSON，
+末行 `{"type":"result",...}`；退出码 `0/1/130`。审批无通道即拒，不阻塞。
+
+### 3.9 Sub-Agent 委派
+
+落点：`internal/subagent`
+
+`subagent.enabled: true` 后模型多出 `delegate_tool`：彼此独立的子任务并行派给子 Agent，
+每个子 Agent 跑在**独立上下文**（新引擎、不落库）里，只回传结构化结论。
+预算：轮次、并发、耗时、回灌长度、排除工具；默认 `maxDepth=1`（子 Agent 不能再委派，
+工具视图里已隐藏，硬调也会被拒）。
+
+### 3.10 记忆与技能
+
+- LTM：`internal/ltm`（SQLite + 关键词检索），`remember_tool` / `recall_tool` 跨会话沉淀；
+- 技能：只扫 `~/.config/code-agent-go/skills` 与工作区 `.config/code-agent-go/skills`，
+  由 `skill_dispatcher` 按 `skill_name` **按需**注入正文（幂等），避免启动即灌满上下文。
+
+---
+
+## 4. 命令行参数
 
 | 参数 | 说明 |
 |------|------|
 | `-c, --config` | 配置文件路径 |
-| `-s, --session-id` | 复用指定会话（不清空历史；不传则新建随机会话） |
-| `-m, --model` | 使用的模型名，对应 `models.items[].name`，缺省 `models.default` |
-| `-y, --approve` | **本次会话**放行高危命令（等价临时 `trusted`，不写盘） |
+| `-s, --session-id` | 指定（或新建）会话 |
+| `--resume ID` | 显式复用某个会话的历史（优先于 `-s`） |
+| `--continue` | 续"上一次会话"（读 `~/.code-agent-go/last_session`），不可与 `-s`/`--resume` 同用 |
+| `-m, --model` | 使用的模型名（对应 `models.items[].name`） |
+| `-p, --print` | 无头运行：跑完直接退出（无位置参数时读 stdin） |
+| `--output text\|json` | 无头输出形态（默认 `text`） |
+| `--show-thinking` | 无头模式下也打印推理增量 |
+| `-y, --approve` | 本次会话放行高危命令（不写盘） |
 | `--trust LEVEL` | 设置并持久化信任态：`trusted`/`untrusted`/`undecided` |
-| `--metrics` | 打开指标导出（单行 JSON，默认 stderr，详下） |
-| `-p, --print` | 无头运行：不启动 TUI，任务跑完直接退出（不给任务参数时从 stdin 读） |
-| `--output text\|json` | 无头模式的输出形态，`json` 为单行 JSON 事件流（默认 `text`） |
-| `--show-thinking` | 无头模式下同时打印推理增量 |
+| `--metrics` | 打开指标与 Span 导出（单行 JSON） |
+| `-e, --enable-tools` | 启用工具 |
+| `-v, --version` | 版本信息 |
 
-## 无头模式（CI / 管道 / 容器）
+---
 
-不需要 TTY 的运行方式。三种触发方式等价：**显式 `-p`**、**stdout 被重定向**、**stdin 是管道**
-（`echo "..." | code-agent-go`），满足任一即不启动 TUI。
+## 5. 配置速览
 
-```bash
-# 任务作为位置参数，答案重定向到文件（stdout 只有助手正文，诊断信息全在 stderr）
-code-agent-go -p "给 utils.go 的 ParseSize 补单元测试" > answer.md
-
-# 管道输入
-cat task.txt | code-agent-go
-
-# 机器可读：所有事件为单行 JSON，末行 type=result 带轮次/工具统计/token 用量
-code-agent-go -p "列出目录" --output json | jq 'select(.type=="result")'
-```
-
-要点：
-
-- **stdout / stderr 分离**：`text` 模式下 stdout 只有助手正文（便于 `>` 落文件），
-  工具调用、运行摘要、日志一律走 stderr；`json` 模式下 stdout 全是结构化行，stderr 保持干净。
-- **高危命令默认拒绝**：无头模式没有审批通道，`rm -rf` 一类命令会被拒绝并回灌给模型自愈；
-  确实要放行请显式 `-y` / `--trust trusted`，让"授权"留在命令行上可见。
-- **退出码**：`0` 完成（工具失败不算运行失败：错误已回灌上下文让模型自愈）、
-  `1` 参数或运行错误、`130` 被 SIGINT/SIGTERM 中断。
-- **JSON 事件**：与 TUI 同源的 `thinking_delta / action_delta / tool_start / tool_result /
-  usage / compaction / approval_required / done`，最后补一行
-  `{"type":"result","data":{"text":...,"turns":...,"tool_calls":...,"tool_errors":...,"usage":{...}}}`。
-
-## 配置
-
-完整样例见 `conf/config.json`，此处只说明生产相关的几段：
+完整样例见 `conf/config.json`：
 
 ```jsonc
 {
-  "token": {
-    "contextWindow": 200000,   // 上下文窗口，压缩阈值与水位的唯一来源
-    "warnRatio": 0.8           // 估算用量超过 80% 时打 token_window_high_water 告警
-  },
-  "models": {
-    "default": "fast",
-    "items": [
-      { "name": "fast",  "provider": "openai", "model": "gpt-4o-mini",
-        "baseURLEnv": "OPENAI_BASE_URL", "apiKeyEnv": "OPENAI_API_KEY" },
-      { "name": "smart", "provider": "openai", "model": "gpt-4o",
-        "baseURLEnv": "OPENAI_BASE_URL", "apiKeyEnv": "OPENAI_API_KEY" }
-    ]
-  },
-  "sandbox": {
-    "enabled": true,           // bash 跑进一次性容器，而不是宿主机
-    "image": "ubuntu:22.04",   // 镜像必须自带 bash
-    "networkDisabled": true,   // --network none，杜绝命令外传数据
-    "readOnlyRootfs": false    // true 时工作目录以只读方式挂载
-  },
-  "observability": {
-    "enabled": true,           // 周期导出指标快照 + 每次 Span 结束输出
-    "exporter": "stderr",      // 交互模式下别用 stdout：TUI 正在往 stdout 画界面
-    "dumpIntervalSecs": 30
-  },
-  "ltm": { "enabled": true, "maxResults": 5 },      // 注册 remember/recall 工具
-  "memory": { "persistence": true }                 // false = 本次运行不落任何历史
+  "token":       { "contextWindow": 200000, "warnRatio": 0.8 },
+  "models":      { "default": "fast", "items": [ /* openai / anthropic / ollama */ ] },
+  "compactor":   { "strategy": "summarization", "minTail": 6 },
+  "sandbox":     { "enabled": false, "image": "ubuntu:22.04", "networkDisabled": true },
+  "subagent":    { "enabled": false, "maxDepth": 1, "maxConcurrent": 3, "maxTurns": 8 },
+  "ltm":         { "enabled": true, "maxResults": 5 },
+  "memory":      { "persistence": true },
+  "tool":        { "enableApproval": true, "dangerCmds": ["kubectl\s+delete"] },
+  "observability": { "enabled": false, "exporter": "stderr", "dumpIntervalSecs": 30 }
 }
 ```
 
-`compactor.contextWindow` 仍然可读（兼容老配置），但不再推荐：
-`token.contextWindow` 是唯一来源，两者都写时以 `token` 为准。
+---
 
-## 生产部署
-
-### 构建镜像
+## 6. 开发
 
 ```bash
-docker build -t code-agent-go:latest .
+make check            # gofmt + go vet + 全量单测（提交前自检）
+make test             # 全量单测
+make test-live        # 连真实 LLM 的集成测试（需要 .env）
+make smoke-headless   # 无头模式端到端冒烟（不需要 Key/网络，7 组断言，需 python3）
+make docker-build     # 构建镜像
 ```
 
-镜像基于 `distroless/static`（只有这一个二进制，没有 shell），因此：
+目录：
 
-- **目录必须可写**：运行时状态全部落在 `HOME` 下（`~/.code-agent-go/`）。
-  会话 SQLite、长期记忆库、信任态文件都在那里，容器里务必给 `HOME` 挂可写卷或匿名卷。
-- **配置文件里的日志路径必须是相对路径**
-  （历史版本里有 `/Users/...` 的绝对路径，进容器后创建日志文件必然失败）。
-- **要不要 TTY**：交互式沿用 `docker run -it`；无头流水线不需要 TTY，
-  把任务作为参数传入即可（`-p` 可省略：无 TTY 时自动走无头路径）。
+| 路径 | 职责 |
+|---|---|
+| `cmd/` | 入口：参数、配置装配、工具注册、TUI/无头分支 |
+| `internal/engine/` | 主循环、流式事件、超时与暂停计时 |
+| `internal/tools/` | 工具注册表与各类工具、审批中间件 |
+| `internal/context_mng/` | token 估算、压缩器、system prompt 拼装 |
+| `internal/provider/` | OpenAI 兼容 / Anthropic 实现与工厂路由 |
+| `internal/headless/` | 无头运行与 TTY 判定 |
+| `internal/subagent/` | Sub-Agent 委派 |
+| `internal/observability/` | 指标、Span、导出器 |
+| `internal/hooks/`,`internal/trust/` | 高危规则与信任态 |
+| `internal/sandbox/`,`internal/ltm/`,`internal/skill/` | 沙箱、长期记忆、技能 |
 
-### 运行
+---
 
-交互：
+## 7. 已知限制
 
-```bash
-docker run -it --rm \
-  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
-  -e OPENAI_BASE_URL="$OPENAI_BASE_URL" \
-  -v "$HOME/.code-agent-go:/home/nonroot/.code-agent-go" \
-  -v "$(pwd):/workspace" -w /workspace \
-  code-agent-go:latest -c /app/conf/config.json
-```
-
-无头（CI / 定时任务，不需要 TTY）：
-
-```bash
-docker run --rm \
-  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
-  -e OPENAI_BASE_URL="$OPENAI_BASE_URL" \
-  -v "$(pwd):/workspace" -w /workspace \
-  code-agent-go:latest -c /app/conf/config.json -p "跑一遍 go test 并汇报失败用例"
-```
-
-### 可观测性
-
-`observability.enabled`（或 `--metrics`）打开后，进程按 `dumpIntervalSecs` 周期输出两类单行 JSON：
-
-```jsonc
-{"type":"metrics","snapshot":{"llm":{"calls":12,"errors":0,"success_rate":1,"avg_latency_ms":820},
- "tool":{"calls":30,"errors":2,"success_rate":0.933,"by_tool":{"bash_tool":{"calls":11,"errors":2}}},
- "token":{"input_tokens":51200,"output_tokens":4200,"total_tokens":55400},
- "compaction":{"count":1,"tokens_saved":7100}}}
-{"type":"span","span":{"trace_id":"...","name":"llm.generate","duration_ms":812,"attrs":{"turn":"3"}}}
-```
-
-采集建议：
-
-- `metrics` 是累计快照（幂等，重复采集不失真），`span` 是一次性事件；
-- 告警可围绕 `tool.success_rate`、`llm.errors`、`token.total_tokens` 三个量做；
-- `token_window_high_water` 日志行表示上下文逼近窗口上限（见 `token.warnRatio`）。
-
-### 安全模型
-
-| 机制 | 位置 | 说明 |
-|------|------|------|
-| 高危命令识别 | `internal/hooks` | 9 条内置规则（`rm -rf`、force push、`DROP TABLE`…）+ 配置黑名单 |
-| 人工审批 | `internal/tools/approve.go` | 交互模式弹窗确认；非交互（无通道）默认拒绝 |
-| 信任态 | `internal/trust` | 三态持久化：undecided（默认，逐个问）/ trusted（放行）/ untrusted（每次都问，无通道则拒） |
-| 沙箱 | `internal/sandbox` | `sandbox.enabled` 时 bash 跑进一次性容器；缺 docker 直接报错而非回落宿主机 |
-
-信任态文件：`~/.code-agent-go/trust.json`。用 `--trust trusted` 落盘，用 `--approve` 只管本次进程。
-
-## 开发
-
-```bash
-make test         # 全量单测
-make build        # 产出 bin/code-agent-go
-make docker-build # 构建镜像
-make test-live    # 连接真实 LLM 的集成测试（需要 .env）
-make smoke-headless  # 无头模式端到端冒烟（不需要 Key/网络，靠 scripts/fake_openai.py 假模型，需 python3）
-```
-
-`make smoke-headless` 覆盖：位置参数、管道输入、`--output json`、高危命令默认拒绝、
-`-y` 放行、缺输入提示、终止信号退出码 130。端口冲突时用 `PORT=8124 make smoke-headless`。
-
-## Sub-Agent 委派
-
-`subagent.enabled: true` 后模型会多出 `delegate_tool`：把彼此独立的子任务并行派给子 Agent，
-子 Agent 跑在独立上下文里，只回传结构化结论（默认 `maxDepth=1`，即子 Agent 不能再委派）。
-详见 `docs/features-and-usage.md` 第 3 节。
-
-## 已知限制
-
-
-- `internal/ltm` 的检索是 SQLite `LIKE` 实现，尚未引入向量检索。
+- token 估算仍是 `字符数/4 + 每条消息固定开销` 的近似，未接入真实 tokenizer；
+- LTM 检索是 SQLite `LIKE`，尚无向量检索；
+- 委派的子 Agent 与主 Agent 共用同一份 Provider 配额，成本随并发线性上升（故默认关闭）。
