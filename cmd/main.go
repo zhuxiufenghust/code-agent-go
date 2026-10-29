@@ -12,7 +12,6 @@ import (
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
 	"github.com/zhuxiufenghust/code-agent-go/internal/config"
@@ -25,6 +24,7 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
 	"github.com/zhuxiufenghust/code-agent-go/internal/sandbox"
 	"github.com/zhuxiufenghust/code-agent-go/internal/skill"
+	subagent "github.com/zhuxiufenghust/code-agent-go/internal/subagent"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tools"
 	"github.com/zhuxiufenghust/code-agent-go/internal/trust"
 	"github.com/zhuxiufenghust/code-agent-go/internal/tui"
@@ -125,7 +125,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("构造 Provider 失败: %v", err)))
 		return 1
 	}
-	registry := registerTools(homeDir, workDir, cfg)
+	registry := registerTools(homeDir, workDir, cfg, pr)
 	ltmStore := openLTM(homeDir, cfg, registry)
 	if ltmStore != nil {
 		defer ltmStore.Close()
@@ -151,12 +151,21 @@ func run() int {
 	} else {
 		log.Warn("工具审批已被显式关闭：高危命令将直接执行")
 	}
-	var sessID string
-	if cliOp.sessionID != "" {
-		sessID = cliOp.sessionID
-	} else {
-		sessID = uuid.New().String()
+	sessID, err := ResolveSessionID(homeDir, SessionPick{
+		SessionID:    cliOp.sessionID,
+		ResumeID:     cliOp.resumeID,
+		ContinueLast: cliOp.continueLast,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, logfmt.FormatMsg("main", fmt.Sprintf("会话选择失败: %v", err)))
+		return 1
 	}
+	// 记录本次会话供 --continue 使用。写失败只告警：它只影响"下次能不能一键续跑"，
+	// 不该因此中断本次任务。
+	if err := SaveLastSession(homeDir, sessID); err != nil {
+		log.Warn("记录最近会话失败", zap.Error(err))
+	}
+	log.Info("本次会话", zap.String("session_id", sessID), zap.String("source", sessionSource(cliOp)))
 
 	engineOpts := []engine.Option{
 		engine.WithWorkDir(workDir),
@@ -404,6 +413,8 @@ func parseFlags(homeDir string, workDir string) {
 	flag.BoolVar(&cliOp.metrics, "metrics", false, "导出指标快照与调用 Span（单行 JSON，默认 stderr）")
 	flag.StringVarP(&cliOp.model, "model", "m", "", "使用的模型名（对应 models.items[].name，缺省取 models.default）")
 	flag.BoolVarP(&cliOp.print, "print", "p", false, "无头运行：不启动 TUI，任务来自参数或 stdin，结果打到标准输出后退出")
+	flag.StringVar(&cliOp.resumeID, "resume", "", "复用指定会话（加载其历史上下文并增量续写）")
+	flag.BoolVar(&cliOp.continueLast, "continue", false, "续上一次会话（不可与 -s/--session-id 或 --resume 同时使用）")
 	flag.StringVar(&cliOp.output, "output", string(headless.FormatText), "无头模式的输出形态：text（正文走 stdout、诊断走 stderr）| json（全部为单行 JSON）")
 	flag.BoolVar(&cliOp.showThinking, "show-thinking", false, "无头模式下同时打印模型推理增量")
 	flag.Parse()
@@ -415,7 +426,7 @@ func parseFlags(homeDir string, workDir string) {
 	cliOp.showVersion = showVersion
 }
 
-func registerTools(homeDir, workDir string, cfg *config.Config) tools.Registry {
+func registerTools(homeDir, workDir string, cfg *config.Config, pr provider.LLMProvider) tools.Registry {
 	register := tools.NewRegistry()
 	// 沙箱开启时把 bash 的执行体换成一次性容器；关闭时就是宿主机直跑（Local）。
 	bashOpts := []tools.BashOption{}
@@ -441,5 +452,46 @@ func registerTools(homeDir, workDir string, cfg *config.Config) tools.Registry {
 	for _, tool := range tools {
 		register.Register(tool)
 	}
+	// 委派工具默认不开启：子 Agent 会额外发起 LLM 与工具调用，
+	// 必须由配置显式打开
+	if cfg.Subagent != nil && cfg.Subagent.Enabled {
+		scfg := subagent.Config{
+			MaxDepth:       cfg.Subagent.MaxDepth,
+			MaxConcurrent:  cfg.Subagent.MaxConcurrent,
+			MaxTurns:       cfg.Subagent.MaxTurns,
+			MaxOutputChars: cfg.Subagent.MaxOutputChars,
+			Timeout:        time.Duration(cfg.Subagent.TimeoutSecs) * time.Second,
+			ExcludeTools:   cfg.Subagent.ExcludeTools,
+			WorkDir:        workDir,
+			HomeDir:        homeDir,
+		}
+		if err := register.Register(subagent.New(scfg, register, pr)); err != nil {
+			log.Warn("注册委派工具失败，本次运行不支持子 Agent 委派", zap.Error(err))
+		} else {
+			log.Info("已启用委派工具（子 Agent 并行委派）", zap.Int("maxConcurrent", cfg.Subagent.MaxConcurrent),
+				zap.Int("maxTurns", cfg.Subagent.MaxTurns), zap.Int("maxDepth", cfg.Subagent.MaxDepth),
+				zap.Strings("excludeTools", cfg.Subagent.ExcludeTools))
+		}
+	}
+	// 委派工具默认关闭：子 Agent 会额外消耗 token 与工具调用，必须由配置显式开启。
+	if sc := cfg.Subagent; sc != nil && sc.Enabled {
+		if err := register.Register(subagent.New(subagent.Config{
+			MaxDepth:       sc.MaxDepth,
+			MaxConcurrent:  sc.MaxConcurrent,
+			MaxTurns:       sc.MaxTurns,
+			MaxOutputChars: sc.MaxOutputChars,
+			Timeout:        time.Duration(sc.TimeoutSecs) * time.Second,
+			ExcludeTools:   sc.ExcludeTools,
+			WorkDir:        workDir,
+			HomeDir:        homeDir,
+		}, register, pr)); err != nil {
+			log.Warn("注册委派工具失败，本次运行不支持子 Agent 委派", zap.Error(err))
+		} else {
+			log.Info("已启用委派工具（Sub-Agent 并行委派）", zap.Int("maxConcurrent", sc.MaxConcurrent),
+				zap.Int("maxTurns", sc.MaxTurns), zap.Int("maxDepth", sc.MaxDepth),
+				zap.Strings("excludeTools", sc.ExcludeTools))
+		}
+	}
+
 	return register
 }
