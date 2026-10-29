@@ -34,6 +34,14 @@ type Registry interface {
 // 超出后仅保留前缀并附截断提示,避免大输出撑爆上下文窗口、放大 token 成本。
 const defaultMaxToolOutput = 20 * 1024
 
+// ToolOutputBudget 是工具可选实现的能力接口：声明自身输出回灌上下文时的
+// 截断上限(字节)，优先于注册表全局的 maxOutputSize。
+// 存在理由：不同工具的合理输出体量不同。命令/文件输出适合较小的通用上限，
+// 而技能正文是成文的规范说明，天然更长，被通用上限切掉会让模型收到残缺的流程说明。
+type ToolOutputBudget interface {
+	MaxOutputSize() int
+}
+
 type registryImpl struct {
 	tools         map[string]Tool
 	maxOutputSize int
@@ -140,23 +148,35 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 		}
 	}
 
+	limit := r.resolveMaxOutputSize(tool)
 	output, err := tool.Execute(ctx, call.Arguments)
 	if err != nil {
 		result = schema.ToolResult{
 			ToolCallID: call.ID,
 			IsError:    true,
-			Output:     truncateToolOutput(call.Name, err.Error(), r.maxOutputSize),
+			Output:     truncateToolOutput(call.Name, err.Error(), limit),
 			Name:       call.Name,
 		}
 	} else {
 		result = schema.ToolResult{
 			ToolCallID: call.ID,
-			Output:     truncateToolOutput(call.Name, output, r.maxOutputSize),
+			Output:     truncateToolOutput(call.Name, output, limit),
 			IsError:    false,
 			Name:       call.Name,
 		}
 	}
 	return result
+}
+
+// resolveMaxOutputSize 决定某个工具的输出上限：
+// 工具自行声明优先（ToolOutputBudget），否则用注册表全局值。
+func (r *registryImpl) resolveMaxOutputSize(tool Tool) int {
+	if budgeted, ok := tool.(ToolOutputBudget); ok {
+		if size := budgeted.MaxOutputSize(); size > 0 {
+			return size
+		}
+	}
+	return r.maxOutputSize
 }
 
 // truncateToolOutput 对工具输出做上限截断,并按工具类型给出差异化的"分段/过滤"建议。
@@ -178,6 +198,8 @@ func truncationHint(toolName string) string {
 		return "命令输出过长,建议用 head/tail/grep/sed 过滤,或将输出重定向到文件后用 read 分段查看。"
 	case "web_fetch_tool", "web_search_tool":
 		return "抓取/检索结果过长,建议缩小范围或改用更精确的 query。"
+	case "skill_dispatcher":
+		return "技能正文过长已截断:正文应只保留主流程步骤,把详细规则/模板拆到技能的 references/ 下,再用 read 按需读取。"
 	default:
 		return "输出过长,请缩小请求范围或分多次获取。"
 	}

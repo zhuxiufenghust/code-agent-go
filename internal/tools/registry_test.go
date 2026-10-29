@@ -25,7 +25,7 @@ func (f *fakeTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 	return f.output, f.err
 }
 
-func newTestRegistry(t *testing.T, maxSize int, tools ...*fakeTool) Registry {
+func newTestRegistry(t *testing.T, maxSize int, tools ...Tool) Registry {
 	t.Helper()
 	var opts []RegistryOption
 	if maxSize > 0 {
@@ -34,7 +34,7 @@ func newTestRegistry(t *testing.T, maxSize int, tools ...*fakeTool) Registry {
 	r := NewRegistry(opts...)
 	for _, tool := range tools {
 		if err := r.Register(tool); err != nil {
-			t.Fatalf("register tool %s failed: %v", tool.name, err)
+			t.Fatalf("register tool failed: %v", err)
 		}
 	}
 	return r
@@ -81,6 +81,43 @@ func TestRegistry_Execute_OutputOverLimitTruncated(t *testing.T) {
 	}
 }
 
+// budgetTool 实现 ToolOutputBudget，声明自己的输出预算。
+type budgetTool struct {
+	fakeTool
+	budget int
+}
+
+func (b *budgetTool) MaxOutputSize() int { return b.budget }
+
+// TestRegistry_Execute_ToolOwnBudgetOverridesGlobal 验证工具可声明自己的输出预算：
+// 技能正文这类天然较长的输出不应被面向命令/文件输出的通用上限切掉。
+func TestRegistry_Execute_ToolOwnBudgetOverridesGlobal(t *testing.T) {
+	const globalLimit = 50
+	out := strings.Repeat("z", 200)
+	tool := &budgetTool{fakeTool: fakeTool{name: "skill_dispatcher", output: out}, budget: 500}
+	r := newTestRegistry(t, globalLimit, tool)
+
+	res := r.Execute(context.Background(), schema.ToolCall{ID: "1", Name: "skill_dispatcher", Arguments: json.RawMessage(`{}`)})
+	if res.IsError {
+		t.Fatalf("unexpected IsError: %v", res.Output)
+	}
+	if res.Output != out {
+		t.Fatalf("预算内输出不应被截断, got len %d want %d", len(res.Output), len(out))
+	}
+}
+
+// TestRegistry_Execute_InvalidToolBudgetFallsBack 验证工具声明非正预算时回落到全局值。
+func TestRegistry_Execute_InvalidToolBudgetFallsBack(t *testing.T) {
+	out := strings.Repeat("w", 300)
+	tool := &budgetTool{fakeTool: fakeTool{name: "read_tool", output: out}, budget: 0}
+	r := newTestRegistry(t, 50, tool)
+
+	res := r.Execute(context.Background(), schema.ToolCall{ID: "1", Name: "read_tool", Arguments: json.RawMessage(`{}`)})
+	if !strings.Contains(res.Output, "...[已截断,共 300 字节]") {
+		t.Fatalf("非正预算应回落到全局上限并截断, got: %s", res.Output)
+	}
+}
+
 // 不同工具应给出与其语义匹配的截断提示。
 func TestRegistry_Execute_TruncationHintByTool(t *testing.T) {
 	cases := []struct {
@@ -91,6 +128,7 @@ func TestRegistry_Execute_TruncationHintByTool(t *testing.T) {
 		{"bash_tool", "建议用 head/tail/grep/sed 过滤"},
 		{"web_fetch_tool", "建议缩小范围或改用更精确的 query"},
 		{"web_search_tool", "建议缩小范围或改用更精确的 query"},
+		{"skill_dispatcher", "把详细规则/模板拆到技能的 references/ 下"},
 		{"unknown_tool", "请缩小请求范围或分多次获取"},
 	}
 	for _, c := range cases {

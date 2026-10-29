@@ -17,10 +17,10 @@ import (
 // mockDDGTransport 是一个 http.RoundTripper，拦截请求并返回预置的
 // DuckDuckGo HTML 风格响应，从而让 Search/Execute 在无外网环境下也可测。
 type mockDDGTransport struct {
-	status      int
-	body        string
-	callCount   int
-	failUntil   int // 前 failUntil 次调用返回错误（用于测试重试）
+	status    int
+	body      string
+	callCount int
+	failUntil int // 前 failUntil 次调用返回错误（用于测试重试）
 }
 
 func (m *mockDDGTransport) RoundTrip(req *http.Request) (*http.Response, error) {

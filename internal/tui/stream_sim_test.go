@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +15,10 @@ import (
 func init() {
 	cfg := zap.NewDevelopmentConfig()
 	cfg.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
-	log.NewLogger(&cfg)
+	if err := log.NewLogger(&cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "初始化日志失败:", err)
+		os.Exit(1)
+	}
 }
 
 // TestActionAccumulatesImmediately 验证：每个增量 delta 到达后立即拼接进同一正文块并渲染，

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"regexp"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"github.com/zhuxiufenghust/code-agent-go/internal/report"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
+	"github.com/zhuxiufenghust/code-agent-go/internal/trust"
 	"go.uber.org/zap"
 )
 
@@ -29,6 +31,39 @@ type ApprovalManager struct {
 	dangerCmds []string
 	emGetter   EmittGetter
 	timeout    time.Duration
+	// trustLevel 是本次进程生效的信任态，决定危险命令是"直接放行/询问/直接拒绝"。
+	// 默认 Undecided，等价于改造前的行为（有通道就问，没通道就拒）。
+	trustLevel trust.Level
+	// trustStore 为 nil 表示不做持久化（只有 --approve 这种会话级授权）。
+	trustStore *trust.Store
+}
+
+// WithTrustLevel 设置本次进程生效的信任态（会话级，不写盘）。
+func WithTrustLevel(l trust.Level) func(*ApprovalManager) {
+	return func(h *ApprovalManager) { h.trustLevel = l }
+}
+
+// WithTrustStore 绑定信任态持久化存储，使信任变更能跨进程保持。
+func WithTrustStore(s *trust.Store) func(*ApprovalManager) {
+	return func(h *ApprovalManager) { h.trustStore = s }
+}
+
+// TrustLevel 返回当前生效的信任态。
+func (h *ApprovalManager) TrustLevel() trust.Level { return h.trustLevel }
+
+// SetTrust 变更信任态。persist 为真且已绑定 Store 时落盘，
+// 落盘失败必须让调用方知道：否则用户以为"以后都不用问了"，重启后又开始问。
+func (h *ApprovalManager) SetTrust(st trust.State, persist bool) error {
+	h.mu.Lock()
+	h.trustLevel = st.Level
+	h.mu.Unlock()
+	if !persist {
+		return nil
+	}
+	if h.trustStore == nil {
+		return errors.New("未绑定信任态存储，无法持久化")
+	}
+	return h.trustStore.Save(st)
 }
 
 func (h *ApprovalManager) SetEmitGetter(emGetter EmittGetter) {
@@ -88,7 +123,7 @@ func (h *ApprovalManager) approvalTimeout() time.Duration {
 
 // IsDangerousCommand 判断该工具调用是否需要人工审批：
 // 内置高危规则（hooks.MatchDangerous，开箱即有底线）+ 配置黑名单（dangerCmds）。
-// 对 bash 只匹配真正的命令字符串，避免把 JSON 键名/路径等无关片段算进匹配范围。
+// 对 bash 只匹配从参数 JSON 中提取出的命令字符串，避免把 JSON 键名/路径等无关片段算进匹配范围。
 func (h *ApprovalManager) IsDangerousCommand(toolName string, args string) bool {
 	// 对于纯读取的工具，默认 YOLO 模式，全部放行
 	if toolName != "bash_tool" && toolName != "edit_tool" && toolName != "write_tool" {
@@ -97,16 +132,30 @@ func (h *ApprovalManager) IsDangerousCommand(toolName string, args string) bool 
 
 	// 针对 bash 的高危模式匹配
 	if toolName == "bash_tool" {
-		if ok, _ := hooks.MatchDangerous(BashCommand(args)); ok {
+		command := BashCommand(args)
+		if ok, _ := hooks.MatchDangerous(command); ok {
 			return true
 		}
 		for _, p := range h.dangerPatterns() {
-			if matched, _ := regexp.MatchString(p, args); matched {
+			if matchDangerPattern(p, command) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// matchDangerPattern 判断配置黑名单项是否命中命令。
+// 黑名单按正则理解（如 "kubectl\s+delete"），但整体加 \b 词边界锚定：
+// 不加边界时 "ls" 会命中 "tools"、"lsblk" 等任何含该子串的文本，
+// 导致审批弹窗远比配置预期频繁。
+func matchDangerPattern(pattern, command string) bool {
+	re, err := regexp.Compile(`\b(?:` + pattern + `)\b`)
+	if err != nil {
+		// 非法正则按不命中处理：黑名单写错不应拦住所有命令。
+		return false
+	}
+	return re.MatchString(command)
 }
 
 // BashCommand 从 bash_tool 的参数 JSON 中取出待执行的命令；
@@ -129,13 +178,24 @@ func (h *ApprovalManager) WaitForApproval(ctx context.Context, call schema.ToolC
 		return schema.ApprovalResult{Allowed: true, Reason: "安全命令，无需人工审批"}, nil
 	}
 	em := h.emitter()
-	if em.ApprovalRequired == nil {
-		// 非交互/无头模式（Run 模式、CI、无 TUI）没有把请求送给人类的通道：
-		// 这里按 deny 处理并记录，绝不能默认放行——否则高危命令在无人看管时被执行。
-		log.Warn("高危命令被拒绝：非交互模式无审批通道",
-			zap.String("tool", call.Name), zap.String("tool_call_id", call.ID))
-		return schema.ApprovalResult{Allowed: false, Reason: "非交互模式无审批通道，默认拒绝高危命令"}, nil
+	// 信任态先于"有没有通道"生效：Trusted 时即便无人值守也放行（这是用户显式授权的语义），
+	// Undecided/Untrusted 且问不到人时一律拒绝。
+	switch trust.Decide(h.trustLevel, em.ApprovalRequired != nil) {
+	case trust.DecisionAllow:
+		log.Info("高危命令按信任态放行", zap.String("tool", call.Name),
+			zap.String("trust_level", h.trustLevel.String()))
+		return schema.ApprovalResult{Allowed: true, Reason: "信任态已授权（trusted），无需再次确认"}, nil
+	case trust.DecisionDeny:
+		reason := "当前信任态不允许在无交互通道下执行高危命令，已拒绝"
+		if em.ApprovalRequired == nil {
+			reason = "非交互模式无审批通道，默认拒绝高危命令"
+		}
+		log.Warn("高危命令被拒绝", zap.String("tool", call.Name),
+			zap.String("trust_level", h.trustLevel.String()),
+			zap.String("tool_call_id", call.ID), zap.String("reason", reason))
+		return schema.ApprovalResult{Allowed: false, Reason: reason}, nil
 	}
+	// DecisionAsk：走人工审批流程
 	// 每次审批独立计时：即便所在工具调用本身没有超时设置，也必须给人类决策一个上限，
 	// 否则 TUI 未响应（崩溃/用户离开）时该 goroutine 会一直挂到整轮运行结束。
 	waitCtx, cancel := context.WithTimeout(ctx, h.approvalTimeout())

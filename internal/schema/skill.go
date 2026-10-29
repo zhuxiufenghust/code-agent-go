@@ -8,6 +8,11 @@ type Skill struct {
 	// 其他head部分字段先省略，后续需要再完善
 	Body string `json:"body"`
 
+	// BaseDir 是技能所在目录的绝对路径。
+	// References/Scripts/Assets 的 Path 是相对于它的，
+	// 模型要真正读到这些素材必须知道这个基准目录。
+	BaseDir string `json:"baseDir,omitempty"`
+
 	Assets     []Asset     `json:"assets,omitempty"`
 	Scripts    []Script    `json:"scripts,omitempty"`
 	References []Reference `json:"references,omitempty"`

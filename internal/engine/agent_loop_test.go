@@ -23,7 +23,10 @@ import (
 func TestMain(m *testing.M) {
 	cfg := zap.NewProductionConfig()
 	cfg.Level = zap.NewAtomicLevelAt(zap.FatalLevel)
-	log.NewLogger(&cfg)
+	if err := log.NewLogger(&cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "初始化日志失败:", err)
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }
 

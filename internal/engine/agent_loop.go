@@ -8,10 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhuxiufenghust/code-agent-go/internal/config"
 	"github.com/zhuxiufenghust/code-agent-go/internal/context_mng"
 	"github.com/zhuxiufenghust/code-agent-go/internal/log"
 	"github.com/zhuxiufenghust/code-agent-go/internal/logfmt"
 	"github.com/zhuxiufenghust/code-agent-go/internal/memory"
+	"github.com/zhuxiufenghust/code-agent-go/internal/observability"
 	"github.com/zhuxiufenghust/code-agent-go/internal/provider"
 	"github.com/zhuxiufenghust/code-agent-go/internal/report"
 	"github.com/zhuxiufenghust/code-agent-go/internal/schema"
@@ -29,12 +31,17 @@ type AgentEngine struct {
 	session  memory.Session // 可选，nil 表示无持久化
 	recovery *context_mng.RecoveryManager
 
+	// noSession 表示配置层显式关闭了会话持久化（既不建 SQLite 也不留内存会话）。
+	noSession bool
+
 	maxConcurrentTools int
 	toolTimeout        time.Duration
-	generateRetries    int           // LLM 生成调用最大尝试次数（默认 3）
-	generateRetryBase  time.Duration // 重试退避基准（默认 1s）
-	workDir            string
-	homeDir            string
+	// runTimeout 是整轮流式运行的总时长上限，0 表示回落到 DefaultRunTimeout。
+	runTimeout        time.Duration
+	generateRetries   int           // LLM 生成调用最大尝试次数（默认 3）
+	generateRetryBase time.Duration // 重试退避基准（默认 1s）
+	workDir           string
+	homeDir           string
 	// usage 是本会话（本 AgentEngine）累计的 token 用量，
 	// 由 generateWithRetry 在每次 LLM 调用成功后累计，与 Provider 级用量解耦。
 	usage schema.Usage
@@ -49,6 +56,14 @@ type AgentEngine struct {
 	emitter      report.Emitter // 可选，事件回调接口
 
 	compactor context_mng.Compactor // 可选，消息压缩器
+
+	// obs 是观测组件，默认 observability.Nop()：
+	// 默认非空让 runLoop 里不需要到处判 nil，代价是一个几乎为零的固定开销。
+	obs observability.Observability
+
+	// tokenWindow / tokenWarnRatio 是上下文窗口水位告警参数（0 表示未配置，关闭告警）。
+	tokenWindow    int
+	tokenWarnRatio float64
 }
 
 func WithToolTimeout(timeout time.Duration) Option {
@@ -68,11 +83,40 @@ func WithMaxConcurrentTools(max int) Option {
 	}
 }
 
+// WithRunTimeout 设置整轮流式运行的总时长上限。
+// 传 <=0 时表示不指定，仍由 engine 内部回落默认上限。
+func WithRunTimeout(timeout time.Duration) Option {
+	return func(e *AgentEngine) {
+		e.runTimeout = timeout
+	}
+}
+
 // WithCompactor 注入上下文压缩器。每轮 LLM 调用前压缩 llmContext，
 // 超预算时按策略裁剪/摘要历史，避免长任务把上下文窗口打爆。
 func WithCompactor(compactor context_mng.Compactor) Option {
 	return func(e *AgentEngine) {
 		e.compactor = compactor
+	}
+}
+
+// WithObservability 注入观测组件（指标聚合 + 关键路径埋点）。
+// 传 nil 等价于注入 Nop。
+func WithObservability(o observability.Observability) Option {
+	return func(e *AgentEngine) {
+		if o == nil {
+			o = observability.Nop()
+		}
+		e.obs = o
+	}
+}
+
+// WithTokenBudget 设置上下文窗口大小与告警水位占比。
+// 它不是压缩阈值（压缩由 compactor 负责），只负责"越窗之前先让人看得见"。
+// window <= 0 时关闭水位告警。
+func WithTokenBudget(window int, warnRatio float64) Option {
+	return func(e *AgentEngine) {
+		e.tokenWindow = window
+		e.tokenWarnRatio = warnRatio
 	}
 }
 
@@ -101,6 +145,12 @@ func WithMaxHistoryMsgLimit(limit int) Option {
 		e.maxHistoryMsgLimit = limit
 	}
 }
+
+// WithDisablePersistence 关闭会话持久化（不建 SQLite 会话，也不落任何历史）。
+func WithDisablePersistence() Option {
+	return func(e *AgentEngine) { e.noSession = true }
+}
+
 func WithSessionID(sessID string) Option {
 	return func(e *AgentEngine) {
 		e.sessionID = sessID
@@ -111,21 +161,34 @@ func (e *AgentEngine) GetEmitter() report.Emitter {
 	return e.emitter
 }
 
+// Observability 返回当前观测组件，供上层导出快照/测试断言。
+func (e *AgentEngine) Observability() observability.Observability { return e.obs }
+
+// MetricsSnapshot 返回当前累计指标快照（token/耗时/工具成功率）。
+func (e *AgentEngine) MetricsSnapshot() observability.Snapshot { return e.obs.Snapshot() }
+
 func NewAgentEngine(provider provider.LLMProvider, registry tools.Registry, opts ...Option) *AgentEngine {
 	engine := &AgentEngine{
 		provider: provider,
 		registry: registry,
 		recovery: context_mng.NewRecoveryManager(),
+		obs:      observability.Nop(),
 	}
 	for _, opt := range opts {
 		opt(engine)
 	}
 
-	var err error
-	engine.session, err = memory.NewSQLiteSession(engine.sessionID, engine.homeDir)
-	if err != nil {
-		log.Error("failed to create SQLite session", zap.Error(err))
-		engine.session, _ = memory.NewMemorySession(engine.sessionID) // fallback to in-memory session
+	// noSession 由 WithDisablePersistence 控制：禁用持久化时连内存会话也不要，
+	// 这样"这次运行不留任何痕迹"是显式可达的语义，而不是靠猜。
+	if engine.noSession {
+		engine.session = nil
+	} else {
+		var err error
+		engine.session, err = memory.NewSQLiteSession(engine.sessionID, engine.homeDir)
+		if err != nil {
+			log.Error("failed to create SQLite session", zap.Error(err))
+			engine.session, _ = memory.NewMemorySession(engine.sessionID) // fallback to in-memory session
+		}
 	}
 	if engine.maxHistoryMsgLimit <= 0 || engine.maxHistoryMsgLimit > 100 {
 		engine.maxHistoryMsgLimit = 100 // default limit
@@ -143,11 +206,18 @@ func (e *AgentEngine) buildSystemPrompt() string {
 }
 
 // 加载历史上下文消息，返回包含系统提示、历史消息和当前用户输入的完整对话上下文。
+//
+// 历史来自会话存储（SQLite，由 WithSessionID 选定的 sessionID 决定取哪一段）；
+// 存储时只落对话轮次、不含 system，因此这里的 system 永远是"本次重新拼装的"。
+// 返回的第二个值是本次新增消息的起始下标，供 SaveHistoryContext 增量落库。
 func (e *AgentEngine) LoadHistoryContext(ctx context.Context, userInput string) ([]schema.Message, int) {
-	// TODO: 实现基于 sessionID 的历史消息加载
 	userMsg := schema.Message{
 		Role:    schema.UserRole,
 		Content: userInput,
+	}
+	if e.session == nil {
+		// 持久化被显式关闭：没有历史可加载，只有 system + 本轮 user。
+		return []schema.Message{{Role: schema.SystemRole, Content: e.buildSystemPrompt()}, userMsg}, 0
 	}
 	msgs, err := e.session.GetMessages(ctx, e.maxHistoryMsgLimit)
 	if err != nil || len(msgs) == 0 {
@@ -312,22 +382,25 @@ func toolCallsSignature(calls []schema.ToolCall) string {
 	return b.String()
 }
 
-// saveTimeout 是收尾落库的独立超时。
+// saveTimeout 是单次落库的独立超时。
 // runLoop 返回时 processCtx 往往已经超时或被取消（用户中断、到达运行上限），
-// 若沿用同一个 ctx 写库会立即失败，本轮进度会整体丢失。
+// 若沿用同一个 ctx 写库会立即失败，本轮进度会整体丢失，因此落库必须脱离调用方 ctx 的取消链路。
 const saveTimeout = 3 * time.Second
 
 func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix string) error {
-	// 落盘 ctx 必须脱离调用方 ctx 的取消链路，保证 defer 收尾时仍可写入。
-	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), saveTimeout)
-	defer cancelSave()
-
 	var turnCount int
 	tools := e.registry.GetAvailableTools()
 	llmContext, startIndex := e.LoadHistoryContext(ctx, userPrompt)
 
 	// persist 把 llmContext 中尚未落库的部分追加写入会话并推进边界，可重复调用。
+	//
+	// 超时 ctx 必须在每次调用内部新建：persist 在整个循环里会被反复调用
+	// （每个 assistant 消息后、每批工具结果后），若像"收尾兜底"那样在循环外
+	// 只建一次，3s 配额会在第一次写入就耗尽，之后每一次都必定 deadline exceeded，
+	// 结果是本轮整份上下文一条都存不下来。
 	persist := func() {
+		saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), saveTimeout)
+		defer cancelSave()
 		startIndex = e.SaveHistoryContext(saveCtx, llmContext, startIndex)
 	}
 
@@ -377,6 +450,8 @@ func (e *AgentEngine) runLoop(ctx context.Context, userPrompt string, logPrefix 
 				llmContext, startIndex = e.applyCompaction(ctx, compacted, startIndex, turnCount, msgsBefore, tokensBefore)
 			}
 		}
+
+		e.checkTokenWater(turnCount, llmContext)
 
 		rspMsg, usage, err := e.generateWithRetry(ctx, turnCount, llmContext, tools)
 		llmEndTime := time.Now()
@@ -508,7 +583,33 @@ func (e *AgentEngine) applyCompaction(ctx context.Context, compacted []schema.Me
 	return compacted, startIndex
 }
 
+// checkTokenWater 在每轮 LLM 调用前检查上下文水位。
+// 它与 compactor 的关系是"预警 vs 处置"：compactor 负责在超预算时真的把上下文压小，
+// 这里只负责在接近上限时留一条可观测的痕迹，便于事后判断"是不是上下文管理策略该调了"。
+func (e *AgentEngine) checkTokenWater(turn int, msgs []schema.Message) {
+	if e.tokenWindow <= 0 {
+		return
+	}
+	ratio := e.tokenWarnRatio
+	if ratio <= 0 || ratio > 1 {
+		ratio = config.DefaultWarnRatio
+	}
+	tokens := context_mng.EstimateTokens(msgs)
+	if int64(tokens) < int64(float64(e.tokenWindow)*ratio) {
+		return
+	}
+	log.Warn("token_window_high_water", zap.Int("turn", turn),
+		zap.Int("estimated_tokens", tokens), zap.Int("context_window", e.tokenWindow),
+		zap.Float64("warn_ratio", ratio), zap.Int("msgs", len(msgs)),
+		zap.String("session_id", e.sessionID))
+}
+
 func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
+	// 根 Span：把一次用户输入引发的多轮 LLM/工具调用串成一棵树，
+	// 排障时先找根再往下 drill down，而不是对着一堆平铺日志猜顺序。
+	ctx, span := e.obs.StartSpan(ctx, observability.SpanRun)
+	defer span.End(nil)
+
 	em := report.Emitter{
 		Generate: func(ctx context.Context, turn int, history []schema.Message, tools []schema.ToolDefinition) (*schema.Message, *schema.Usage, error) {
 			return e.provider.Generate(ctx, history, tools)
@@ -534,6 +635,8 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 		// ApproveManager 会据此“默认放行”（向后兼容）。若在这里放一个必然返回 false
 		// 的空实现，反而会让高危命令在无人审批的场景下被静默拒绝。
 	}
-	e.UpdateEmitter(em)
+	// 埋点织到回调层而不是散进 runLoop：观测是横切关注点，
+	// 集中在一处才能保证"所有 LLM/工具调用都被统计"这件事被编译器之外的约定兜住。
+	e.UpdateEmitter(observability.Instrument(ctx, em, e.obs))
 	return e.runLoop(ctx, userPrompt, "agent-run")
 }
