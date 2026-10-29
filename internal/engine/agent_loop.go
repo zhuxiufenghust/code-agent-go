@@ -206,8 +206,11 @@ func (e *AgentEngine) buildSystemPrompt() string {
 }
 
 // 加载历史上下文消息，返回包含系统提示、历史消息和当前用户输入的完整对话上下文。
+//
+// 历史来自会话存储（SQLite，由 WithSessionID 选定的 sessionID 决定取哪一段）；
+// 存储时只落对话轮次、不含 system，因此这里的 system 永远是"本次重新拼装的"。
+// 返回的第二个值是本次新增消息的起始下标，供 SaveHistoryContext 增量落库。
 func (e *AgentEngine) LoadHistoryContext(ctx context.Context, userInput string) ([]schema.Message, int) {
-	// TODO: 实现基于 sessionID 的历史消息加载
 	userMsg := schema.Message{
 		Role:    schema.UserRole,
 		Content: userInput,
